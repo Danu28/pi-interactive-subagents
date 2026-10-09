@@ -211,6 +211,26 @@ export function registerToolExtension(name: string, extensionPath: string): void
   registerToolExtension,
 };
 
+// Tools shipped as pi packages (`pi install npm:<pkg>`) live under
+// <agentConfigDir>/npm/node_modules and are NOT auto-discovered into
+// extensions/. Map their package entry points here so subagents still get an
+// explicit `-e` path without a bridging file in extensions/ (which would
+// double-load and conflict at the top level).
+const PACKAGE_TOOL_EXTENSIONS: Record<string, { pkg: string; entry: string }> = {
+  web_search: { pkg: "pi-web-access", entry: "dist/index.js" },
+  fetch_content: { pkg: "pi-web-access", entry: "dist/index.js" },
+  get_search_content: { pkg: "pi-web-access", entry: "dist/index.js" },
+  source_check: { pkg: "pi-web-access", entry: "dist/index.js" },
+};
+
+/** Resolve a package-installed tool extension under <agentConfigDir>/npm/node_modules. */
+function installedPackageToolExtension(tool: string): string | undefined {
+  const spec = PACKAGE_TOOL_EXTENSIONS[tool];
+  if (!spec) return undefined;
+  const candidate = join(getAgentConfigDir(), "npm", "node_modules", spec.pkg, spec.entry);
+  return existsSync(candidate) ? candidate : undefined;
+}
+
 /**
  * Map a custom (non-built-in) tool name to the pi-extension file that
  * registers it. Used to build the child's `--extension` whitelist after
@@ -235,19 +255,19 @@ function getToolExtensionPath(tool: string): string | undefined {
     tool_search: "builtin:tool-search",
   };
   // Prefer the built-in path when it exists on disk. Fall back to a
-  // runtime-registered override when the built-in was disabled/removed.
+  // runtime-registered override when the built-in was disabled/removed, then
+  // to a package-installed copy under <agentConfigDir>/npm/node_modules.
   // On machines without global pi extensions installed (notably fresh
   // Windows installs with no ~/.pi/agent/extensions/), still return the
   // known mapped path so callers get a stable mapping — launch filters
   // missing files with existsSync before passing -e to the child.
   const builtin = map[tool];
-  if (builtin) {
-    if (existsSync(builtin)) return builtin;
-    const extra = EXTRA_TOOL_EXTENSIONS.get(tool);
-    if (extra) return extra;
-    return builtin;
-  }
-  return EXTRA_TOOL_EXTENSIONS.get(tool);
+  if (builtin && existsSync(builtin)) return builtin;
+  const extra = EXTRA_TOOL_EXTENSIONS.get(tool);
+  if (extra) return extra;
+  const installed = installedPackageToolExtension(tool);
+  if (installed) return installed;
+  return builtin;
 }
 
 /**

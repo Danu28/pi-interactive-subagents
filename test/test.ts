@@ -1298,15 +1298,32 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    // Normalize separators: join() yields backslashes on Windows.
-    const norm = (p: string | undefined) => p?.replace(/\\/g, "/");
-    assert.ok(norm(testApi.getToolExtensionPath("web_search"))?.endsWith("web-search/index.ts"));
-    assert.ok(norm(testApi.getToolExtensionPath("safe_bash"))?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
+    await withIsolatedAgentEnv(async () => {
+      assert.equal(testApi.getToolExtensionPath("read"), undefined);
+      assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+      // Normalize separators: join() yields backslashes on Windows.
+      const norm = (p: string | undefined) => p?.replace(/\\/g, "/");
+      assert.ok(norm(testApi.getToolExtensionPath("web_search"))?.endsWith("web-search/index.ts"));
+      assert.ok(norm(testApi.getToolExtensionPath("safe_bash"))?.endsWith("tools/safe-bash.ts"));
+      // Spawning tools are registered by this extension itself.
+      assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    });
+  });
+
+  it("falls back to a package-installed tool extension under <agentDir>/npm/node_modules", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const entryDir = join(globalDir, "npm", "node_modules", "pi-web-access", "dist");
+      mkdirSync(entryDir, { recursive: true });
+      writeFileSync(join(entryDir, "index.js"), "export default function () {}\n");
+      const norm = (p: string | undefined) => p?.replace(/\\/g, "/");
+      // Mapped tool (also in the legacy map) resolves to the installed package.
+      assert.ok(norm(testApi.getToolExtensionPath("web_search"))?.endsWith("pi-web-access/dist/index.js"));
+      // Tools only known to the package map resolve too.
+      for (const tool of ["fetch_content", "get_search_content", "source_check"]) {
+        assert.ok(norm(testApi.getToolExtensionPath(tool))?.endsWith("pi-web-access/dist/index.js"), tool);
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
