@@ -1276,16 +1276,16 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
+  it("bundled worker is an implementation leaf without spawning tools", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+    assert.equal(worker.subagentAgents, undefined);
 
-    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
+    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: false });
     assert.ok(allowlist, "expected an allowlist");
     const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
-      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
+    for (const t of ["subagent", "subagent_message", "subagents_list", "subagent_status", "subagent_stop"]) {
+      assert.ok(!tools.has(t), `worker must not receive spawning tool ${t}`);
     }
     assert.ok(tools.has("bash"), "expected worker to keep bash");
   });
@@ -1967,6 +1967,10 @@ describe("tool registration", () => {
 
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
+    assert.match(subagentTool.description, /Plan before spawning/);
+    assert.match(subagentTool.description, /Do not spawn every available role/);
+    assert.match(subagentTool.description, /Parallelize only independent tasks/);
+    assert.match(subagentTool.promptSnippet, /smallest useful team/);
 
     const props = subagentTool.parameters.properties;
     assert.deepEqual(

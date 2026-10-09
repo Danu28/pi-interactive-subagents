@@ -15,7 +15,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 ╰────────────────────────────────────────────────────╯
 ```
 
-Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
+Delegate selectively. Plan the work first, use the fewest agents that add distinct value, and parallelize only independent tasks. For implementation that depends on reconnaissance or research, wait for those results before assigning the worker.
 
 tmux panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). Windows Terminal places Pi on the left and the first subagent on the right; later active subagents stack top-to-bottom in the right-hand area. Focus returns to Pi after each spawn. The tmux layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
 
@@ -42,7 +42,6 @@ There is also a `/subagent <agent> <task>` command for spawning directly, and a
 ### Spawning
 
 ```typescript
-subagent({ agent: "scout", task: "Analyze the auth module" });
 subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
 ```
 
@@ -53,6 +52,15 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
+
+### Choosing and sequencing agents
+
+- **Worker:** owns a cohesive implementation or review task. It does not spawn children.
+- **Scout:** use for read-only repository reconnaissance only when the relevant code or architecture is unfamiliar. For dependent work, wait for its report before starting the worker.
+- **Researcher:** use only when an external fact, API, or current documentation needs investigation.
+- **Parallel calls:** use only for independent work with separate outputs. Do not spawn every role by default.
+
+For example, a login-page task in an unfamiliar application may use one scout to map existing routing/auth/UI patterns, then one worker to implement and test the page. Skip the researcher unless an external auth provider needs investigation; skip the scout if the relevant code is already clear.
 
 ### Messaging
 
@@ -113,8 +121,7 @@ channel:
   finished one (delivered as a keystroke in tmux, or through a file inbox on the process backend).
 - **Sub-agent → orchestrator:** `ask_question` (a single question; the agent parks as `waiting` for
   the reply) and its final assistant message, returned as the result.
-- **Sub-agent → its own children:** an agent whose frontmatter grants `subagent_agents` (e.g.
-  `worker`) can spawn and message those children by name, but only the agents on its allowlist.
+- **Sub-agent → its own children:** only agents whose frontmatter explicitly grants `subagent_agents` can spawn children, restricted to that allowlist. The bundled `worker` is a leaf implementation agent and cannot spawn children.
 
 Agents therefore cannot message their siblings, and nothing is shared between parallel agents except
 through the orchestrator.
@@ -125,7 +132,7 @@ through the orchestrator.
 | ----- | ----- | ----- | ---- |
 | **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **researcher** | `opencode-go/glm-5.3-flash` | `web_search`, `fetch_content`, `codemode` | Web research, synthesized into a sourced brief |
-| **worker** | `opencode-go/muse-spark-1.3-contributor` | `read`, `write`, `edit`, `bash`, `powershell`, `web_search`, `fetch_content`, `codemode` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **worker** | `opencode-go/muse-spark-1.3-contributor` | `read`, `write`, `edit`, `bash`, `powershell`, `web_search`, `fetch_content`, `codemode` | General implementation agent; does not spawn children |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -179,7 +186,7 @@ With `auto-exit: true`, the session shuts down when the agent's turn ends — th
 Notes:
 
 - **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
-- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
+- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when an explicitly configured parent agent has child sub-agents still running.
 
 ### interactive
 

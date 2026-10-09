@@ -120,6 +120,13 @@ const SubagentParams = Type.Object({
   ),
 });
 
+const SUBAGENT_ORCHESTRATION_GUIDANCE =
+  "Plan before spawning and use the smallest useful team; most coding tasks need one worker or no subagents. " +
+  "Do not spawn every available role by default. Use scout only for needed read-only repository reconnaissance, " +
+  "researcher only for external facts or documentation, and worker for implementation. " +
+  "Parallelize only independent tasks; if implementation depends on reconnaissance or research, wait for those results first. " +
+  "The main session owns delegation and integration.";
+
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
@@ -1987,19 +1994,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
+        SUBAGENT_ORCHESTRATION_GUIDANCE + " " +
         "Spawn a sub-agent on a dedicated surface (tmux or Windows Terminal pane when available, otherwise a background process). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "When the sub-agent finishes, the harness automatically delivers its result as a steer message that wakes you up and starts a new turn. " +
+        "Do not poll for completion or fabricate results; wait for the delivered result before integrating dependent work.",
       promptSnippet:
+        SUBAGENT_ORCHESTRATION_GUIDANCE + " " +
         "Spawn a sub-agent on a dedicated surface (tmux or Windows Terminal pane when available, otherwise a background process). " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "This is a fire-and-forget async tool; completion is automatically delivered as a steer message. " +
+        "Do not poll for completion or fabricate results.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
