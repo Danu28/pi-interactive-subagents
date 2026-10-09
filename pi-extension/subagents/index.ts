@@ -2341,7 +2341,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: Type.Object({}),
 
       async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+        const modelOverrides = readSubagentModelOverrides();
+        const list = discoverAgentDefinitions()
+          .filter((agent) => !agent.disableModelInvocation)
+          .map((agent) => ({
+            ...agent,
+            model: resolveEffectiveModel({}, agent, modelOverrides[agent.name]),
+          }));
 
         if (list.length === 0) {
           return {

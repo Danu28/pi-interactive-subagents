@@ -1500,6 +1500,25 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("lists each agent's configured model in subagents_list", async () => {
+    await withIsolatedAgentEnv(async () => {
+      (subagentsModule as any).__test__.writeSubagentModelOverrides({
+        scout: "opencode-go/muse-spark-1.2-contributor",
+      });
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((registered) => registered.name === "subagents_list");
+      assert.ok(tool, "expected subagents_list to be registered");
+
+      const result = await tool.execute();
+      const scout = result.details?.agents.find((agent: any) => agent.name === "scout");
+      const worker = result.details?.agents.find((agent: any) => agent.name === "worker");
+      assert.equal(scout?.model, "opencode-go/muse-spark-1.2-contributor");
+      assert.ok(result.content[0].text.includes("scout [opencode-go/muse-spark-1.2-contributor]"));
+      assert.equal(worker?.model, "opencode-go/gpt-6-luna");
+    });
+  });
+
   it("lists visible agents from discovery", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
