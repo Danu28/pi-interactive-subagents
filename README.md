@@ -44,8 +44,14 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly, and a
-`/subagents` command (or **Ctrl+Alt+S**) to inspect and control running agents.
+There is also a `/subagent <agent> <task>` command for spawning directly, a
+`/subagent-models [agent]` command to choose/reset persistent per-agent model
+defaults, and a `/subagents` command (or **Ctrl+Alt+S**) to inspect and control
+running agents. Model overrides are stored in
+`~/.pi/agent/subagent-models.json` (or the directory set by
+`PI_CODING_AGENT_DIR`) and apply to future spawns; an explicit `model` passed to
+`subagent()` still takes precedence, followed by this setting and then the
+agent profile's `model` field.
 
 ### Spawning
 

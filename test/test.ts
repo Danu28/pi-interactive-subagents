@@ -1476,6 +1476,20 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("persists per-agent model overrides in the global agent config directory", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const testApi = (subagentsModule as any).__test__;
+      assert.deepEqual(testApi.readSubagentModelOverrides(), {});
+
+      testApi.writeSubagentModelOverrides({ scout: "openrouter/model-a", worker: "provider/model-b" });
+      assert.deepEqual(testApi.readSubagentModelOverrides(), {
+        scout: "openrouter/model-a",
+        worker: "provider/model-b",
+      });
+      assert.equal(existsSync(join(globalDir, "subagent-models.json")), true);
+    });
+  });
+
   it("lists visible agents from discovery", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1905,6 +1919,35 @@ describe("tmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
+  it("/subagent-models saves a selected model for an agent", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const { api, registeredCommands } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const configure = registeredCommands.find((command) => command.name === "subagent-models");
+      assert.ok(configure, "expected /subagent-models to be registered");
+
+      const notifications: string[] = [];
+      await configure.handler("scout", {
+        hasUI: true,
+        modelRegistry: {
+          getAvailable: () => [{ provider: "openrouter", id: "model-a", name: "Model A" }],
+        },
+        ui: {
+          async select(_title: string, options: string[]) {
+            assert.ok(options.includes("openrouter/model-a — Model A"));
+            return "openrouter/model-a — Model A";
+          },
+          notify(message: string) { notifications.push(message); },
+        },
+      });
+
+      assert.deepEqual((subagentsModule as any).__test__.readSubagentModelOverrides(), {
+        scout: "openrouter/model-a",
+      });
+      assert.match(notifications[0] ?? "", /scout set to openrouter\/model-a/);
+    });
+  });
+
   it("/subagent emits a spawn tool call for a known agent", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 

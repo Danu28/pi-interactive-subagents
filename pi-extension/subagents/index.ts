@@ -184,6 +184,43 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+function getSubagentModelOverridesPath(): string {
+  return join(getAgentConfigDir(), "subagent-models.json");
+}
+
+function readSubagentModelOverrides(): Record<string, string> {
+  const path = getSubagentModelOverridesPath();
+  if (!existsSync(path)) return {};
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not read subagent model settings at ${path}: ${detail}`);
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      `Invalid subagent model settings at ${path}: expected an object mapping agent names to model IDs.`,
+    );
+  }
+
+  const overrides: Record<string, string> = {};
+  for (const [agent, model] of Object.entries(parsed)) {
+    if (typeof model !== "string" || !model.trim()) {
+      throw new Error(`Invalid subagent model setting for "${agent}" in ${path}: expected a non-empty model ID.`);
+    }
+    overrides[agent] = model;
+  }
+  return overrides;
+}
+
+function writeSubagentModelOverrides(overrides: Record<string, string>): void {
+  const path = getSubagentModelOverridesPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(overrides, null, 2)}\n`, "utf8");
+}
+
 // ── Runtime tool-extension registration ─────────────────────────────────────
 // `getToolExtensionPath` otherwise only knows a closed set of tool names. Other
 // pi extensions that bundle a tool for subagents (e.g. a project-local
@@ -1410,6 +1447,8 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  readSubagentModelOverrides,
+  writeSubagentModelOverrides,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
@@ -1470,7 +1509,9 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const configuredModel =
+    params.model == null && params.agent ? readSubagentModelOverrides()[params.agent] : undefined;
+  const effectiveModel = params.model ?? configuredModel ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -2890,6 +2931,97 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     description: "Manage running subagents (view output / message / stop)",
     handler: async (ctx) => {
       await runSubagentManager(ctx);
+    },
+  });
+
+  // /subagent-models command — configure persistent per-agent model defaults
+  pi.registerCommand("subagent-models", {
+    description: "Choose or reset the default model for each subagent",
+    handler: async (args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("/subagent-models requires an interactive UI.", "warning");
+        return;
+      }
+
+      const agents = discoverAgentDefinitions();
+      if (agents.length === 0) {
+        ctx.ui.notify("No subagents are available to configure.", "warning");
+        return;
+      }
+
+      const requestedAgent = args.trim();
+      let agentName = requestedAgent;
+      if (requestedAgent) {
+        if (!agents.some((agent) => agent.name === requestedAgent)) {
+          ctx.ui.notify(
+            `Unknown subagent "${requestedAgent}". Available agents: ${agents.map((agent) => agent.name).join(", ")}.`,
+            "error",
+          );
+          return;
+        }
+      } else {
+        const selected = await ctx.ui.select(
+          "Choose a subagent to configure",
+          agents.map((agent) => agent.name),
+        );
+        if (!selected) return;
+        agentName = selected;
+      }
+
+      let overrides: Record<string, string>;
+      try {
+        overrides = readSubagentModelOverrides();
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        return;
+      }
+
+      const availableModels = ctx.modelRegistry
+        .getAvailable()
+        .filter((model) => model.type == null || model.type === "chat")
+        .sort((a, b) => `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
+      if (availableModels.length === 0) {
+        ctx.ui.notify("No available chat models found. Configure a provider/model in pi first.", "warning");
+        return;
+      }
+
+      const profileModel = loadAgentDefaults(agentName)?.model;
+      const optionToModel = new Map<string, string>();
+      const modelOptions = availableModels.map((model) => {
+        const modelId = `${model.provider}/${model.id}`;
+        const label = `${modelId} — ${model.name}${overrides[agentName] === modelId ? " (current)" : ""}`;
+        optionToModel.set(label, modelId);
+        return label;
+      });
+      const selected = await ctx.ui.select(
+        `Default model for ${agentName} (agent profile: ${profileModel ?? "not set"})`,
+        ["Use agent profile default", ...modelOptions],
+      );
+      if (!selected) return;
+
+      if (selected === "Use agent profile default") {
+        delete overrides[agentName];
+      } else {
+        const modelId = optionToModel.get(selected);
+        if (!modelId) return;
+        overrides[agentName] = modelId;
+      }
+
+      try {
+        writeSubagentModelOverrides(overrides);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Could not save subagent model setting: ${detail}`, "error");
+        return;
+      }
+
+      const model = overrides[agentName];
+      ctx.ui.notify(
+        model
+          ? `Default model for ${agentName} set to ${model}.`
+          : `Default model for ${agentName} reset to the agent profile setting${profileModel ? ` (${profileModel})` : " (none)"}.`,
+        "info",
+      );
     },
   });
 
