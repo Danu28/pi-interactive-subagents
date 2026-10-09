@@ -4,6 +4,12 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 **tmux-first fork with Windows support.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
+## Install
+
+```bash
+pi install git:github.com/Danu28/pi-interactive-subagents
+```
+
 ## How it works
 
 `subagent()` returns immediately. Where tmux is available, the sub-agent runs in its own tmux pane. On native Windows, when pi is running inside Windows Terminal, it runs in a visible split pane; otherwise it uses a detached background process. All modes keep the same fire-and-forget flow. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
