@@ -1,18 +1,19 @@
 /**
  * Surface layer — the only terminal/process abstraction this extension uses.
  *
- * Two backends:
+ * Surface backends:
  * - `tmux` (default wherever tmux is available): visible panes, keystroke
  *   steering, screen scraping. See tmux.ts.
- * - `process` (used automatically without tmux — notably native Windows):
- *   detached background processes with file-based exit detection, log-tail
- *   screen reads, and inbox-file steering. See process-backend.ts.
+ * - `windows-terminal` (auto-detected inside Windows Terminal): visible panes
+ *   running Git Bash scripts with sidecar-based process tracking.
+ * - `process` (fallback): detached background processes with file-based exit
+ *   detection and inbox-file steering. See process-backend.ts.
  *
- * Backend selection: `PI_SUBAGENT_BACKEND=tmux|process` forces one;
- * otherwise tmux is used when available and the process backend is the
- * fallback. Everything the extension does to a subagent surface goes through
- * this file so index.ts stays backend-agnostic (and testable without a
- * multiplexer running).
+ * Backend selection: `PI_SUBAGENT_BACKEND=tmux|process|windows-terminal` can
+ * force a backend; otherwise tmux wins, then Windows Terminal when detected,
+ * then the background process fallback. Everything the extension does to a
+ * subagent surface goes through this file so index.ts stays backend-agnostic
+ * (and testable without a multiplexer running).
  */
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,25 +34,34 @@ import {
 import {
   isProcessSurface,
   createProcessSurface,
+  createWindowsTerminalSurface,
   runScriptInBackground,
+  runScriptInWindowsTerminal,
   getProcessExit,
   isProcessAlive,
   readProcessLog,
   closeProcessSurface,
   findBash,
+  findWindowsTerminal,
+  isWindowsTerminalSurface,
 } from "./process-backend.ts";
 
 export { shellEscape, isProcessSurface };
 export type { PollResult } from "./tmux.ts";
 
-export type Backend = "tmux" | "process";
+export type Backend = "tmux" | "process" | "windows-terminal";
 
 /** Which backend surfaces will use (honors PI_SUBAGENT_BACKEND). */
 export function backendInUse(): Backend {
   const forced = (process.env.PI_SUBAGENT_BACKEND ?? "auto").trim().toLowerCase();
   if (forced === "tmux") return "tmux";
   if (forced === "process") return "process";
-  return isTmuxAvailable() ? "tmux" : "process";
+  if (forced === "windows-terminal") return "windows-terminal";
+  if (isTmuxAvailable()) return "tmux";
+  if (process.platform === "win32" && process.env.WT_SESSION && findWindowsTerminal()) {
+    return "windows-terminal";
+  }
+  return "process";
 }
 
 /**
@@ -67,7 +77,7 @@ export function isMuxAvailable(): boolean {
 export function muxSetupHint(): string {
   if (isTmuxAvailable()) return tmuxSetupHint();
   if (process.platform === "win32") {
-    return "Subagents run as background processes on Windows (no tmux needed; requires Git for Windows bash).";
+    return "Windows Terminal panes are used when available; otherwise subagents run as background processes. Both require Git for Windows bash.";
   }
   return `Subagents require tmux. ${tmuxSetupHint()}`;
 }
@@ -78,7 +88,11 @@ export function muxSetupHint(): string {
  * on Windows for its bash tool).
  */
 export function getBackendProblem(): string | null {
-  if (backendInUse() !== "process") return null;
+  const backend = backendInUse();
+  if (backend === "windows-terminal" && !findWindowsTerminal()) {
+    return "Cannot launch subagent pane: wt.exe was not found; set PI_SUBAGENT_WT_EXE or use the process backend.";
+  }
+  if (backend === "tmux") return null;
   if (!findBash()) {
     return (
       "Cannot launch subagent: no usable bash found. Install Git for Windows " +
@@ -96,11 +110,13 @@ export function isSurfaceAlive(surface: string): boolean {
 }
 
 /**
- * Create a surface for a subagent: a tmux split off the parent pi's pane, or
- * a background-process handle when tmux is unavailable.
+ * Create a surface for a subagent: a tmux or Windows Terminal pane, or a
+ * background-process handle when no pane-capable terminal is available.
  */
 export function createSurface(name: string): string {
-  if (backendInUse() === "tmux") return tmuxCreateSurface(name);
+  const backend = backendInUse();
+  if (backend === "tmux") return tmuxCreateSurface(name);
+  if (backend === "windows-terminal") return createWindowsTerminalSurface(name);
   return createProcessSurface();
 }
 
@@ -120,14 +136,17 @@ export function sendCommand(surface: string, command: string): void {
 
 /**
  * Send a long command to a surface by writing it to a script file first.
- * tmux panes execute it via keystrokes; process surfaces spawn it detached
- * with output captured to `<scriptPath>.log`. Returns the script path.
+ * Terminal panes execute it visibly; process surfaces spawn it detached with
+ * output captured to `<scriptPath>.log`. Returns the script path.
  */
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; cwd?: string },
 ): string {
+  if (isWindowsTerminalSurface(surface)) {
+    return sendWindowsTerminalCommand(surface, command, options);
+  }
   if (!isProcessSurface(surface)) {
     return tmuxSendLongCommand(surface, command, options);
   }
@@ -141,7 +160,24 @@ export function sendLongCommand(
   }
   scriptParts.push(command);
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", { mode: 0o755 });
-  runScriptInBackground(surface, scriptPath);
+  runScriptInBackground(surface, scriptPath, { cwd: options?.cwd });
+  return scriptPath;
+}
+
+function sendWindowsTerminalCommand(
+  surface: string,
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string; cwd?: string },
+): string {
+  const scriptPath =
+    options?.scriptPath ??
+    join(tmpdir(), "pi-subagent-scripts", `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`);
+  mkdirSync(dirname(scriptPath), { recursive: true });
+  const scriptParts = ["#!/bin/bash"];
+  if (options?.scriptPreamble) scriptParts.push(options.scriptPreamble.trimEnd());
+  scriptParts.push(command);
+  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", { mode: 0o755 });
+  runScriptInWindowsTerminal(surface, scriptPath, { cwd: options?.cwd });
   return scriptPath;
 }
 

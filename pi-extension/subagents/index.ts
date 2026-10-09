@@ -291,6 +291,11 @@ function sanitizeLabel(name: string): string {
   return name.replace(/[\r\n]+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "").trim() || "subagent";
 }
 
+/** Preserve the child's actual exit status while emitting a pane-readable sentinel. */
+function withSubagentExitSentinel(command: string): string {
+  return `${command}; __pi_subagent_exit=$?; printf '__SUBAGENT_DONE_%s__\\n' "$__pi_subagent_exit"; exit "$__pi_subagent_exit"`;
+}
+
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
   const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
   return match ? match[1].trim() : undefined;
@@ -1424,6 +1429,7 @@ export const __test__ = {
   getStallTimeoutMs,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  withSubagentExitSentinel,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1562,7 +1568,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = withSubagentExitSentinel(`${cdPrefix}${cmdParts.join(" ")}`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1574,6 +1580,7 @@ async function launchSubagent(
 
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
+      cwd: effectiveCwd ?? ctx.cwd,
       scriptPreamble: [
         `# Claude Code subagent launch script for ${sanitizeLabel(params.name)}`,
         `# Generated: ${new Date().toISOString()}`,
@@ -1705,7 +1712,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = withSubagentExitSentinel(piCommand);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1715,6 +1722,7 @@ async function launchSubagent(
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
+    cwd: effectiveCwd ?? ctx.cwd,
     scriptPreamble: [
       `# Subagent launch script for ${sanitizeLabel(params.name)}`,
       `# Generated: ${new Date().toISOString()}`,
@@ -1979,14 +1987,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent on a dedicated surface (a terminal multiplexer pane where available, otherwise a background process). " +
+        "Spawn a sub-agent on a dedicated surface (tmux or Windows Terminal pane when available, otherwise a background process). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent on a dedicated surface (a terminal multiplexer pane where available, otherwise a background process). " +
+        "Spawn a sub-agent on a dedicated surface (tmux or Windows Terminal pane when available, otherwise a background process). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -2170,12 +2178,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           });
 
         // Return immediately
+        const runLocation =
+          backendInUse() === "windows-terminal"
+            ? "in a visible Windows Terminal pane"
+            : backendInUse() === "process"
+              ? "in the background"
+              : "in a visible terminal pane";
         return {
           content: [
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
+                `Sub-agent "${params.name}" launched ${runLocation}. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.`,
@@ -2718,7 +2732,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = withSubagentExitSentinel(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2731,6 +2745,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
+          cwd: loadout.cwd ?? ctx.cwd,
           scriptPreamble: [
             `# Subagent resume script for ${sanitizeLabel(name)}`,
             `# Generated: ${new Date().toISOString()}`,

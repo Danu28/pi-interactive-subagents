@@ -1,18 +1,16 @@
 /**
- * Process surface backend — runs subagents as detached background processes.
+ * Windows process surfaces — detached background processes and visible
+ * Windows Terminal panes. tmux.ts remains the Unix multiplexer backend;
+ * surface.ts selects the appropriate surface.
  *
- * Used automatically on platforms without tmux (notably native Windows, where
- * pi runs on Git Bash). tmux.ts remains the backend wherever tmux is
- * available; surface.ts picks between the two.
- *
- * Per subagent (keyed by surface handle `proc:<id>`):
+ * Per subagent (keyed by `proc:<id>` or `wt:<id>`):
  * - the launch script is written to `<scriptPath>` (same bash content the
  *   tmux path would type into a pane),
- * - stdout/stderr stream to `<scriptPath>.log` (readScreen reads its tail),
- * - the harness exit code is captured via the child handle and persisted to
- *   `<scriptPath>.exitcode` (pollForExit reads it — no terminal scraping),
- * - live steering arrives via the session inbox `<sessionFile>.steer`
- *   (appended by the parent, polled by the child's subagent-done.ts).
+ * - background-process stdout/stderr stream to `<scriptPath>.log`,
+ * - Windows Terminal panes display the live TUI; wrapper PID/exit sidecars
+ *   let the parent stop and monitor the pane's process,
+ * - live steering arrives via `<sessionFile>.steer` for process-managed
+ *   surfaces (appended by the parent, polled by the child's subagent-done.ts).
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import {
@@ -31,40 +29,69 @@ import { dirname } from "node:path";
 export interface ProcRecord {
   id: string;
   handle: string;
+  kind: "process" | "windows-terminal";
+  name?: string;
   child: ChildProcess | null;
   scriptPath: string | null;
+  wrapperPath: string | null;
+  pidFile: string | null;
   logFile: string | null;
   exitFile: string | null;
   exitCode: number | null;
+  launchStartedAt: number | null;
   spawnError?: string;
   logFd: number | null;
 }
 
 const procRecords = new Map<string, ProcRecord>();
 
-/** True for handles owned by this backend (`proc:<id>`). */
+/** True for process-managed surfaces (`proc:<id>` and `wt:<id>`). */
 export function isProcessSurface(surface: string): boolean {
-  return surface.startsWith("proc:");
+  return surface.startsWith("proc:") || surface.startsWith("wt:");
 }
 
-/** Create a surface handle. The process is spawned by runScriptInBackground. */
-export function createProcessSurface(): string {
+/** True for surfaces rendered in a Windows Terminal pane. */
+export function isWindowsTerminalSurface(surface: string): boolean {
+  return surface.startsWith("wt:");
+}
+
+function createSurfaceRecord(
+  kind: ProcRecord["kind"],
+  prefix: "proc:" | "wt:",
+  name?: string,
+): string {
   const id = Math.random().toString(16).slice(2, 10);
-  const handle = `proc:${id}`;
+  const handle = `${prefix}${id}`;
   procRecords.set(handle, {
     id,
     handle,
+    kind,
+    name,
     child: null,
     scriptPath: null,
+    wrapperPath: null,
+    pidFile: null,
     logFile: null,
     exitFile: null,
     exitCode: null,
+    launchStartedAt: null,
     logFd: null,
   });
   return handle;
 }
 
+/** Create a hidden process surface. */
+export function createProcessSurface(): string {
+  return createSurfaceRecord("process", "proc:");
+}
+
+/** Reserve a visible Windows Terminal surface; it opens when launched. */
+export function createWindowsTerminalSurface(name: string): string {
+  return createSurfaceRecord("windows-terminal", "wt:", name);
+}
+
 let bashCache: string | null | undefined;
+let windowsTerminalCache: string | null | undefined;
 
 /**
  * True when `candidate` is an MSYS-family bash (Git Bash, MSYS2, Cygwin) that
@@ -127,6 +154,58 @@ export function findBash(): string | null {
 /** Test hook: drop the cached bash lookup so tests start clean. */
 export function resetFindBashCache(): void {
   bashCache = undefined;
+  windowsTerminalCache = undefined;
+}
+
+/** Resolve wt.exe (including the Windows App Execution Alias). */
+export function findWindowsTerminal(): string | null {
+  if (windowsTerminalCache !== undefined) return windowsTerminalCache;
+  if (process.platform !== "win32") return (windowsTerminalCache = null);
+
+  const override = process.env.PI_SUBAGENT_WT_EXE?.trim();
+  if (override) return (windowsTerminalCache = override);
+
+  try {
+    const result = spawnSync("where.exe", ["wt.exe"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    });
+    const candidate = (result.stdout ?? "").split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (!result.error && result.status === 0 && candidate) {
+      windowsTerminalCache = candidate;
+      return candidate;
+    }
+  } catch {
+    // The explicit override below remains available on unusual Windows setups.
+  }
+
+  windowsTerminalCache = null;
+  return null;
+}
+
+/** Build the Windows Terminal CLI arguments for a side-by-side agent pane. */
+export function buildWindowsTerminalArgs(params: {
+  windowId: string;
+  cwd: string;
+  title: string;
+  bash: string;
+  wrapperPath: string;
+  scriptPath: string;
+}): string[] {
+  const title = params.title.replace(/[\r\n]+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "").trim() || "Subagent";
+  return [
+    "-w", params.windowId,
+    "split-pane", "-H",
+    "--startingDirectory", params.cwd,
+    "--title", title,
+    "--suppressApplicationTitle",
+    params.bash,
+    params.wrapperPath,
+    params.scriptPath,
+    ";",
+    "move-focus", "previous",
+  ];
 }
 
 function safeCloseLog(record: ProcRecord): void {
@@ -162,11 +241,110 @@ function markExited(record: ProcRecord, code: number, note?: string): void {
 }
 
 /**
+ * Launch a script in a visible Windows Terminal split pane. The wrapper writes
+ * native PID and exit-code sidecars because wt.exe itself is only a dispatcher.
+ */
+export function runScriptInWindowsTerminal(
+  surface: string,
+  scriptPath: string,
+  opts?: { cwd?: string; name?: string },
+): string {
+  let record = procRecords.get(surface);
+  if (!record) {
+    createProcessSurfaceRecord(surface);
+    record = procRecords.get(surface)!;
+  }
+  const wrapperPath = `${scriptPath}.wt.sh`;
+  const pidFile = `${wrapperPath}.pid`;
+  const logFile = `${scriptPath}.log`;
+  const exitFile = `${scriptPath}.exitcode`;
+  record.kind = "windows-terminal";
+  record.name = opts?.name ?? record.name;
+  record.scriptPath = scriptPath;
+  record.wrapperPath = wrapperPath;
+  record.pidFile = pidFile;
+  record.logFile = logFile;
+  record.exitFile = exitFile;
+  record.launchStartedAt = Date.now();
+  record.exitCode = null;
+
+  const header =
+    `# Launched: ${new Date().toISOString()}\n# Surface: ${surface}\n# Script: ${scriptPath}\n` +
+    `# Live terminal output is displayed in the Windows Terminal pane.\n`;
+  const bash = findBash();
+  const wt = findWindowsTerminal();
+  if (!bash || !wt) {
+    const msg = !bash
+      ? "subagents: no usable Git/MSYS bash found for the Windows Terminal pane."
+      : "subagents: wt.exe was not found. Start pi inside Windows Terminal or set PI_SUBAGENT_WT_EXE.";
+    record.spawnError = msg;
+    try {
+      mkdirSync(dirname(scriptPath), { recursive: true });
+      writeFileSync(logFile, `${header}${msg}\n`, "utf8");
+    } catch {
+      // Best effort.
+    }
+    markExited(record, 127);
+    return scriptPath;
+  }
+
+  try {
+    mkdirSync(dirname(scriptPath), { recursive: true });
+    rmSync(exitFile, { force: true });
+    rmSync(pidFile, { force: true });
+    writeFileSync(logFile, header, "utf8");
+    const wrapper = [
+      "#!/usr/bin/env bash",
+      "wrapper_path=$(cygpath -u \"${BASH_SOURCE[0]}\")",
+      "script_path=$(cygpath -u \"$1\")",
+      "windows_pid=$(ps -W -p \"$$\" | awk 'NR == 2 {print $4}')",
+      "printf '%s\\n' \"${windows_pid:-$$}\" > \"${wrapper_path}.pid\"",
+      "bash \"$script_path\"",
+      "status=$?",
+      "exit_path=\"${wrapper_path%.wt.sh}.exitcode\"",
+      "printf '%s\\n' \"$status\" > \"$exit_path\"",
+      "exit \"$status\"",
+    ].join("\n") + "\n";
+    writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
+
+    const args = buildWindowsTerminalArgs({
+      windowId: process.env.PI_SUBAGENT_WT_WINDOW?.trim() || "0",
+      cwd: opts?.cwd ?? process.cwd(),
+      title: record.name ?? "Subagent",
+      bash,
+      wrapperPath,
+      scriptPath,
+    });
+    const child = spawn(wt, args, {
+      cwd: opts?.cwd ?? process.cwd(),
+      env: process.env,
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    record.child = child;
+    child.on("error", (err) => {
+      record!.spawnError = err?.message ?? String(err);
+      markExited(record!, 127, `subagents: failed to start wt.exe: ${record!.spawnError}`);
+    });
+    child.on("exit", (code) => {
+      if (record!.child === child) record!.child = null;
+      // wt.exe is a short-lived command dispatcher. A zero exit means the
+      // split request was accepted, not that the subagent has finished.
+      if (code != null && code !== 0 && record!.exitCode == null) {
+        markExited(record!, code, `subagents: wt.exe exited with code ${code}`);
+      }
+    });
+    child.unref();
+  } catch (err: any) {
+    record.spawnError = err?.message ?? String(err);
+    markExited(record, 127, `subagents: failed to open Windows Terminal pane: ${record.spawnError}`);
+  }
+  return scriptPath;
+}
+
+/**
  * Spawn a previously-written launch script as a detached background process.
- * Never throws: spawn failures are recorded as exit code 127 with details in
- * the log, so pollForExit surfaces a clear error instead of hanging.
- *
- * Returns the script path.
+ * Spawn failures are recorded so pollForExit reports a failure instead of hanging.
  */
 export function runScriptInBackground(
   surface: string,
@@ -241,15 +419,20 @@ export function runScriptInBackground(
 }
 
 function createProcessSurfaceRecord(surface: string): void {
-  const id = surface.startsWith("proc:") ? surface.slice("proc:".length) : surface;
+  const prefix = surface.startsWith("wt:") ? "wt:" : "proc:";
+  const id = surface.startsWith(prefix) ? surface.slice(prefix.length) : surface;
   procRecords.set(surface, {
     id,
     handle: surface,
+    kind: prefix === "wt:" ? "windows-terminal" : "process",
     child: null,
     scriptPath: null,
+    wrapperPath: null,
+    pidFile: null,
     logFile: null,
     exitFile: null,
     exitCode: null,
+    launchStartedAt: null,
     logFd: null,
   });
 }
@@ -280,13 +463,33 @@ export function getProcessExit(surface: string, exitFile?: string | null): numbe
 }
 
 /**
- * True while the process may still be running. Unknown (tmux-style) surfaces
- * are not ours — this only answers for `proc:` handles.
+ * True while a process-managed surface is still running. WT panes use a PID
+ * sidecar because the wt.exe command dispatcher exits immediately.
  */
 export function isProcessAlive(surface: string): boolean {
   const record = procRecords.get(surface);
-  if (!record) return false;
-  return record.exitCode == null;
+  if (!record || record.exitCode != null) return false;
+  if (record.kind !== "windows-terminal") return true;
+  if (getProcessExit(surface) != null) return false;
+
+  if (record.pidFile && existsSync(record.pidFile)) {
+    try {
+      const pid = Number.parseInt(readFileSync(record.pidFile, "utf8").trim(), 10);
+      if (!Number.isInteger(pid) || pid <= 0) return false;
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err: any) {
+        return err?.code === "EPERM";
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  // Allow time for wt.exe to dispatch the pane and for its wrapper to publish
+  // a PID. A missing pane is reported as a failure after the startup grace.
+  return record.launchStartedAt != null && Date.now() - record.launchStartedAt < 15_000;
 }
 
 /** Read the tail of a process surface's log (readScreen equivalent). */
@@ -307,6 +510,24 @@ export function closeProcessSurface(surface: string): void {
   if (!record) return;
   const child = record.child;
   try {
+    if (record.kind === "windows-terminal" && record.exitCode == null && record.pidFile) {
+      try {
+        const pid = Number.parseInt(readFileSync(record.pidFile, "utf8").trim(), 10);
+        if (Number.isInteger(pid) && pid > 0) {
+          if (process.platform === "win32") {
+            spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+              stdio: "ignore",
+              timeout: 5000,
+              windowsHide: true,
+            });
+          } else {
+            process.kill(pid, "SIGTERM");
+          }
+        }
+      } catch {
+        // Pane may already have exited or been closed manually.
+      }
+    }
     if (child && child.exitCode == null && record.exitCode == null) {
       // Windows: kill the whole tree BEFORE the launcher dies. Terminating the
       // bash launcher first makes `taskkill /T` fail ("process not found") and

@@ -1,12 +1,12 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes (or background processes on Windows). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes, Windows Terminal split panes, or background processes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 **tmux-first fork with Windows support.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
 ## How it works
 
-`subagent()` returns immediately. Where tmux is available, the sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. Without tmux (notably native Windows), it runs as a detached background process instead — same fire-and-forget flow, no visible pane. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. Where tmux is available, the sub-agent runs in its own tmux pane. On native Windows, when pi is running inside Windows Terminal, it runs in a visible split pane; otherwise it uses a detached background process. All modes keep the same fire-and-forget flow. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+tmux panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). Windows Terminal uses its native split layout and restores focus to the parent pane after spawning. The tmux layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -29,7 +29,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent on a dedicated surface — tmux pane where available, background process otherwise (async) |
+| `subagent` | Spawn a sub-agent on a dedicated surface — tmux/Windows Terminal pane where available, background process otherwise (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagent_status` | Inspect what running sub-agents are doing right now (live status + optional output tail) |
 | `subagent_stop` | Stop (kill) one named sub-agent, or all of them |
@@ -233,20 +233,30 @@ tmux new -A -s pi 'pi'
 
 ### Windows (no tmux needed)
 
-On native Windows the extension uses a background-process backend automatically:
-subagents spawn as detached processes (via Git Bash, the same bash pi itself
-requires on Windows), completion is detected via files, and steering a running
-subagent is delivered through a session inbox the child polls. No tmux install,
-no WSL, no extra terminal setup.
+When pi is started inside Windows Terminal, subagents automatically open in
+side-by-side Windows Terminal panes. Their live TUI output is visible there;
+status and final results continue to flow back to the parent pi session. Parent
+messages are delivered through the session inbox. This requires Windows Terminal
+and Git Bash, both commonly present on Windows development setups.
 
-Backend selection honors `PI_SUBAGENT_BACKEND=tmux|process` (default: tmux when
-available, otherwise background processes). On the process backend, interactive
-(non-`auto-exit`) agents are run to autonomous completion, since there is no
-visible pane to drive or close — interaction still works via `ask_question`.
+Outside Windows Terminal, the extension falls back to detached background
+processes (also via Git Bash). Those runs are tracked in the status widget and
+can be inspected from `/subagents`. The process backend forces interactive
+profiles to complete autonomously because it has no visible pane; Windows
+Terminal panes respect the agent profile's interaction settings.
+
+Backend selection honors `PI_SUBAGENT_BACKEND=tmux|process|windows-terminal`.
+Tmux remains first when available; otherwise Windows Terminal is selected when
+`WT_SESSION` and `wt.exe` are detected, then the process backend is used. Set
+`PI_SUBAGENT_BACKEND=process` to force hidden background runs. `PI_SUBAGENT_WT_WINDOW`
+selects a Windows Terminal window ID (`0` means most recently used; this is the
+default), useful when several WT windows are open.
 
 ```powershell
-# optional: pin a bash executable if it isn't on PATH
+# Optional: pin Git Bash if automatic discovery misses it
 $env:PI_SUBAGENT_BASH = "C:\Program Files\Git\bin\bash.exe"
+# Optional: select a specific Windows Terminal window
+$env:PI_SUBAGENT_WT_WINDOW = "0"
 ```
 
 ## Acknowledgements

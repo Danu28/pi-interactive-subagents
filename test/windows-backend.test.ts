@@ -22,12 +22,15 @@ import * as surface from "../pi-extension/subagents/surface.ts";
 import {
   appendSteerMessage,
   countSteerInboxLines,
+  buildWindowsTerminalArgs,
   createProcessSurface,
   findBash,
+  findWindowsTerminal,
   getProcessExit,
   isMsysBash,
   isProcessAlive,
   isProcessSurface,
+  isWindowsTerminalSurface,
   readSteerInboxAfter,
   readSteerInboxEntriesAfter,
   resetFindBashCache,
@@ -79,14 +82,50 @@ describe("backend selection", () => {
     assert.equal(surface.backendInUse(), "tmux");
   });
 
-  it("falls back to the process backend without tmux", () => {
-    setBackend("auto");
-    delete process.env.TMUX;
-    // No tmux binary in this environment, so auto must pick process.
-    // (On a machine with tmux installed + TMUX set, tmux wins — by design.)
-    if (!process.env.TMUX) {
-      assert.ok(["tmux", "process"].includes(surface.backendInUse()));
+  it("auto-selects Windows Terminal panes when running inside Windows Terminal", () => {
+    const oldWtSession = process.env.WT_SESSION;
+    const oldTmux = process.env.TMUX;
+    try {
+      setBackend("auto");
+      delete process.env.TMUX;
+      if (process.platform === "win32" && findWindowsTerminal()) {
+        process.env.WT_SESSION = "test-session";
+        assert.equal(surface.backendInUse(), "windows-terminal");
+      } else {
+        delete process.env.WT_SESSION;
+        assert.equal(surface.backendInUse(), "process");
+      }
+    } finally {
+      if (oldWtSession === undefined) delete process.env.WT_SESSION;
+      else process.env.WT_SESSION = oldWtSession;
+      if (oldTmux === undefined) delete process.env.TMUX;
+      else process.env.TMUX = oldTmux;
     }
+  });
+
+  it("honors explicit Windows Terminal backend selection", () => {
+    setBackend("windows-terminal");
+    assert.equal(surface.backendInUse(), "windows-terminal");
+    const handle = surface.createSurface("Visible worker");
+    assert.equal(isWindowsTerminalSurface(handle), true);
+    assert.equal(isProcessSurface(handle), true);
+    surface.closeSurface(handle);
+  });
+
+  it("builds a split-pane command and restores focus to the parent pane", () => {
+    const args = buildWindowsTerminalArgs({
+      windowId: "0",
+      cwd: "C:/project with spaces",
+      title: "Worker\nOne",
+      bash: "C:/Program Files/Git/bin/bash.exe",
+      wrapperPath: "C:/project/wrapper.sh",
+      scriptPath: "C:/project/launch.sh",
+    });
+    assert.ok(args.includes("split-pane"));
+    assert.ok(args.includes("-H"));
+    assert.ok(args.includes("C:/project with spaces"));
+    assert.ok(args.includes("Worker One"));
+    assert.deepEqual(args.slice(-3), [";", "move-focus", "previous"]);
   });
 
   it("isMuxAvailable is true for the process backend (no tmux needed)", () => {
@@ -107,6 +146,68 @@ describe("backend selection", () => {
   it("getBackendProblem is null for the tmux backend", () => {
     setBackend("tmux");
     assert.equal(surface.getBackendProblem(), null);
+  });
+});
+
+describe("Windows Terminal split surfaces", () => {
+  it("preserves the agent exit code in the completion sentinel", () => {
+    const bash = findBash();
+    if (!bash) {
+      console.log("⚠️  no bash — skipping completion sentinel test");
+      return;
+    }
+    const command = (subagentsModule as any).__test__.withSubagentExitSentinel("false");
+    const result = spawnSync(bash, ["-c", command], { encoding: "utf8", timeout: 5000 });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout ?? "", /__SUBAGENT_DONE_1__/);
+  });
+
+  it("uses the wrapper exit sidecar and PID to track a visible pane", async () => {
+    setBackend("windows-terminal");
+    const handle = surface.createSurface("WT lifecycle");
+    const dir = mkdtempSync(join(tmpdir(), "pi-wt-lifecycle-"));
+    try {
+      const record = __procTest__.procRecords.get(handle)!;
+      record.launchStartedAt = Date.now();
+      record.pidFile = join(dir, "wrapper.pid");
+      record.exitFile = join(dir, "launch.exitcode");
+      writeFileSync(record.pidFile, `${process.pid}\n`, "utf8");
+      assert.equal(isProcessAlive(handle), true);
+
+      writeFileSync(record.exitFile, "23\n", "utf8");
+      const result = await surface.pollForExit(handle, new AbortController().signal, { interval: 10 });
+      assert.equal(result.exitCode, 23);
+      assert.equal(isProcessAlive(handle), false);
+    } finally {
+      surface.closeSurface(handle);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats visible Windows Terminal handles as process-managed for inbox steering", () => {
+    setBackend("windows-terminal");
+    const handle = surface.createSurface("WT Worker");
+    const testApi = (subagentsModule as any).__test__;
+    const dir = mkdtempSync(join(tmpdir(), "pi-wt-steer-"));
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      const running = {
+        id: "wt1",
+        name: "WT Worker",
+        task: "",
+        surface: handle,
+        startTime: 0,
+        sessionFile,
+      };
+      const result = testApi.steerSubagent(running, "check progress", () => {
+        throw new Error("WT panes use the session inbox, not injected keystrokes");
+      });
+      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(readSteerInboxAfter(sessionFile, 0).messages, ["check progress"]);
+    } finally {
+      surface.closeSurface(handle);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

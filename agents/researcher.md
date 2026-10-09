@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
 tools: web_search, fetch_content, codemode
-model: opencode-go/glm-5.3-flash
+model: opencode-go/gpt-6-luna
 thinking: medium
 system-prompt: append
 auto-exit: true

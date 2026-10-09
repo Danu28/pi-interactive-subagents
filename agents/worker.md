@@ -3,7 +3,7 @@ name: worker
 description: General-purpose worker — reads, writes, and edits code
 tools: read, write, edit, bash, powershell, web_search, fetch_content, codemode
 subagent_agents: scout, researcher
-model: opencode-go/muse-spark-1.3-contributor
+model: opencode-go/gpt-6-luna
 thinking: high
 system-prompt: append
 auto-exit: true
