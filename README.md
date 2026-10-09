@@ -31,10 +31,13 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | --- | --- |
 | `subagent` | Spawn a sub-agent on a dedicated surface — tmux pane where available, background process otherwise (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
+| `subagent_status` | Inspect what running sub-agents are doing right now (live status + optional output tail) |
+| `subagent_stop` | Stop (kill) one named sub-agent, or all of them |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly.
+There is also a `/subagent <agent> <task>` command for spawning directly, and a
+`/subagents` command (or **Ctrl+Alt+S**) to inspect and control running agents.
 
 ### Spawning
 
@@ -71,6 +74,50 @@ Every spawn records name → session file in `artifacts/<sessionId>/subagent-reg
 A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Parallel questions are supported — each waiting sub-agent has its own name.
 
 If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the pane stays open until a human closes it. Only available inside sub-agent sessions.
+
+### Controlling running sub-agents
+
+You never have to guess what a sub-agent is doing, and you can always stop it:
+
+- **Watch it.** The widget above the editor shows each agent's name, elapsed time, and live
+  status — `active · bash 2m` (with the current tool), `waiting`, `starting`, or `stalled`.
+  On tmux you can also read the pane directly; on the process backend the agent's output streams
+  to its launch-script `.log`.
+- **Ask the orchestrator.** "What is scout doing?" → the model calls `subagent_status`, which
+  lists every running agent with its live status, and can include the tail of its output
+  (`outputLines`).
+- **Open the manager.** `/subagents` (or **Ctrl+Alt+S**) lists running agents; picking one lets you
+  *View live output*, *Send a message*, or *Stop this sub-agent* (with confirmation).
+- **Stop directly.** `/subagents stop <name>` stops one; `/subagents <name>` prints its status;
+  the model can call `subagent_stop({ name })` or `subagent_stop({ all: true })` when you ask it to.
+
+Stopping kills the surface immediately and reports a distinct **"stopped"** result (not a
+completion), so neither you nor the orchestrator mistakes it for finished work. The session file is
+kept, so a stopped agent can still be resumed later with `subagent_message`.
+
+**Hung agents resolve on their own when their surface disappears.** If a tmux pane is killed
+externally, or a background-process handle is released without an exit code, the watcher now
+notices and reports a failure instead of polling forever. For genuinely stuck-but-alive agents you
+can opt into an inactivity watchdog:
+
+```bash
+export PI_SUBAGENT_STALL_TIMEOUT_MS=600000   # auto-stop after 10m continuously stalled (default: off)
+```
+
+### Agent-to-agent communication
+
+Communication is **hierarchical, not peer-to-peer** — there is no sibling-to-sibling or broadcast
+channel:
+
+- **Orchestrator → sub-agent:** `subagent_message({ name })` steers a running agent or resumes a
+  finished one (delivered as a keystroke in tmux, or through a file inbox on the process backend).
+- **Sub-agent → orchestrator:** `ask_question` (a single question; the agent parks as `waiting` for
+  the reply) and its final assistant message, returned as the result.
+- **Sub-agent → its own children:** an agent whose frontmatter grants `subagent_agents` (e.g.
+  `worker`) can spawn and message those children by name, but only the agents on its allowlist.
+
+Agents therefore cannot message their siblings, and nothing is shared between parallel agents except
+through the orchestrator.
 
 ## Bundled agents
 

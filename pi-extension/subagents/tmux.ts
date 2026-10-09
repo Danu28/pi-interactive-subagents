@@ -238,6 +238,29 @@ export function closeSurface(surface: string): void {
   rebalanceSurfaces();
 }
 
+/**
+ * True while a tmux pane still exists.
+ *
+ * Used to detect a surface that vanished without ever printing the completion
+ * sentinel — most commonly because the user (or another tool) killed the pane.
+ * Without this check `pollForExit` would read a dead pane forever and the
+ * subagent would appear hung indefinitely. When tmux itself is unavailable we
+ * cannot tell, so we preserve the previous optimistic behaviour and report
+ * alive.
+ */
+export function isTmuxSurfaceAlive(surface: string): boolean {
+  if (!isTmuxAvailable()) return true;
+  try {
+    const out = execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{pane_id}"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out.startsWith("%");
+  } catch {
+    return false;
+  }
+}
+
 // ── Exit polling ──
 
 export interface PollResult {

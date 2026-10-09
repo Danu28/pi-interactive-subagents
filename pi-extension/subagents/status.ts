@@ -3,6 +3,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
+/** No snapshot advance for this long while active (non-tool) => stalled. */
+export const INACTIVITY_STALLED_AFTER_MS = 120_000;
+/** Longer budget for tools, which can legitimately run for minutes. */
+export const TOOL_INACTIVITY_STALLED_AFTER_MS = 900_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
@@ -287,6 +291,18 @@ export function observeStatus(
   };
 }
 
+/**
+ * Milliseconds the subagent has continuously satisfied the "stalled"
+ * condition, or 0 when it is not currently stalled. Backs the parent's
+ * optional inactivity watchdog (PI_SUBAGENT_STALL_TIMEOUT_MS).
+ */
+export function stallDurationMs(state: SubagentStatusState, now: number): number {
+  if (classifyStatus(state, now).kind !== "stalled") return 0;
+  const referenceMs =
+    state.snapshotProblemSinceMs ?? state.lastActivityAtMs ?? state.firstObservationAtMs ?? state.startTimeMs;
+  return Math.max(0, now - referenceMs);
+}
+
 export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
   if (state.source === "claude") return state;
 
@@ -365,6 +381,9 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   if (state.snapshotState === "present") {
     if (state.phase === "active" || state.activeNow) {
       kind = "active";
+      const inactiveForMs = state.lastActivityAtMs == null ? 0 : now - state.lastActivityAtMs;
+      const inactivityLimit = state.activeScope === "tool" ? TOOL_INACTIVITY_STALLED_AFTER_MS : INACTIVITY_STALLED_AFTER_MS;
+      if (inactiveForMs >= inactivityLimit) { kind = "stalled"; statusLabel = "no recent activity"; }
     } else if (state.phase === "waiting") {
       kind = "waiting";
     } else if (state.phase === "done") {

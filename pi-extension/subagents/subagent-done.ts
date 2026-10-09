@@ -20,9 +20,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { writeFileSync } from "node:fs";
+import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
-import { countSteerInboxLines, readSteerInboxAfter } from "./process-backend.ts";
+import { countSteerInboxLines, readSteerInboxEntriesAfter } from "./process-backend.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -200,27 +200,28 @@ export default function (pi: ExtensionAPI) {
 
   function pollSteerInbox(): void {
     if (!steerSessionFile) return;
-    let messages: string[];
+    let entries: { message: string; line: number }[];
     let nextLine: number;
     try {
-      const read = readSteerInboxAfter(steerSessionFile, steerSeenLines);
-      messages = read.messages;
+      const read = readSteerInboxEntriesAfter(steerSessionFile, steerSeenLines);
+      entries = read.entries;
       nextLine = read.nextLine;
     } catch {
       return;
     }
-    if (messages.length === 0) {
+    if (entries.length === 0) {
       steerSeenLines = nextLine;
       return;
     }
-    for (const message of messages) {
+    for (const entry of entries) {
       try {
-        pi.sendUserMessage(message);
+        pi.sendUserMessage(entry.message);
       } catch {
-        // The agent loop wouldn't take input right now; retry the whole
-        // batch on the next tick instead of dropping or skipping it.
+        // The agent loop wouldn't take input right now; advance past only
+        // the messages already delivered and retry the rest next tick.
         return;
       }
+      steerSeenLines = entry.line + 1;
     }
     steerSeenLines = nextLine;
   }
@@ -436,7 +437,20 @@ export default function (pi: ExtensionAPI) {
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      const askFile = `${sessionFile}.ask`;
+      const tmpFile = `${askFile}.${process.pid}.tmp`;
+      try {
+        writeFileSync(tmpFile, JSON.stringify(askData));
+        renameSync(tmpFile, askFile);
+      } catch {
+        try {
+          rmSync(tmpFile, { force: true });
+        } catch {
+          // Best effort.
+        }
+        // Fall back to a direct write so the signal is still delivered.
+        writeFileSync(askFile, JSON.stringify(askData));
+      }
 
       return {
         content: [

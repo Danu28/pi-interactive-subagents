@@ -29,7 +29,7 @@ import {
   getBackendProblem,
   backendInUse,
 } from "./surface.ts";
-import { appendSteerMessage } from "./process-backend.ts";
+import { appendSteerMessage, getProcessExit } from "./process-backend.ts";
 
 import {
   countSessionEntryLines,
@@ -58,6 +58,7 @@ import {
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
+  stallDurationMs,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -164,6 +165,8 @@ const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
   "subagents_list",
+  "subagent_status",
+  "subagent_stop",
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
@@ -263,6 +266,11 @@ function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
 }
 
+/** Collapse a display name to a single safe comment line. */
+function sanitizeLabel(name: string): string {
+  return name.replace(/[\r\n]+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "").trim() || "subagent";
+}
+
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
   const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
   return match ? match[1].trim() : undefined;
@@ -287,11 +295,12 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const normalized = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+  const match = normalized.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
 
   const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const body = normalized.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
@@ -514,8 +523,9 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
  */
 function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+  if (!raw || !/^\d+$/.test(raw)) return 500;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) ? n : 500;
 }
 
 function muxUnavailableResult() {
@@ -564,13 +574,22 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "cancelled" | "stopReason"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+
+  if (result.cancelled) {
+    const reason = result.stopReason ? ` (${result.stopReason})` : "";
+    return (
+      `Sub-agent "${name}" stopped after ${formatElapsed(result.elapsed)}${reason}.\n\n` +
+      `It did not produce a completion summary. Its session is preserved, so you can ` +
+      `continue it with subagent_message if the work is still needed.${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -607,6 +626,10 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** True when the run was stopped by the user/model instead of finishing. */
+  cancelled?: boolean;
+  /** Short reason recorded when the run was stopped. */
+  stopReason?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -641,6 +664,17 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /**
+   * Set when the user (via subagent_stop or /subagents) or an inactivity
+   * watchdog stops this run. The watcher reports a "stopped" result instead of
+   * a completion, and no summary is produced.
+   */
+  stopReason?: string;
+  /**
+   * Set when the run is being reaped to hand off to a resume, so its own
+   * watcher must not post a completion/failure message for the old surface.
+   */
+  suppressResult?: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -995,6 +1029,11 @@ function resolveRunningByName(name: string):
   const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
   if (matches.length === 1) return { running: matches[0] };
   if (matches.length === 0) {
+    const ci = Array.from(runningSubagents.values()).filter(
+      (r) => r.name.toLowerCase() === requestedName.toLowerCase(),
+    );
+    if (ci.length === 1) return { running: ci[0] };
+    if (ci.length > 1) return { error: `Ambiguous subagent name "${requestedName}". Matches: ${ci.map((r) => `${r.name} [${r.id}]`).join(", ")}` };
     const names = Array.from(runningSubagents.values()).map((r) => r.name);
     const hint = names.length
       ? ` Currently running: ${[...new Set(names)].join(", ")}.`
@@ -1008,20 +1047,21 @@ function resolveRunningByName(name: string):
 
 /**
  * Type a follow-up message into a running subagent's live session. Newlines are
- * collapsed to spaces because each newline submits a turn in the child's TUI
- * editor; a multi-line message would otherwise fire as several partial turns.
+ * collapsed to spaces on tmux because each newline submits a turn in the child's
+ * TUI editor; a multi-line message would otherwise fire as several partial turns.
+ * The process backend uses a JSON-line inbox that safely transports newlines,
+ * so messages there keep their internal line breaks.
  */
 function steerSubagent(
   running: RunningSubagent,
   message: string,
   send: (surface: string, command: string) => void = sendCommand,
 ): { ok: true } | { error: string } {
-  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   if (isProcessSurface(running.surface)) {
     // Background processes accept no keystrokes: queue into the session inbox,
     // which the child's subagent-done.ts polls and injects as its next turn.
     try {
-      appendSteerMessage(running.sessionFile, flattened);
+      appendSteerMessage(running.sessionFile, message.trim());
       return { ok: true };
     } catch (error: any) {
       return {
@@ -1031,6 +1071,7 @@ function steerSubagent(
       };
     }
   }
+  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
     send(running.surface, flattened);
     return { ok: true };
@@ -1087,6 +1128,173 @@ function handleSubagentSteer(
   };
 }
 
+/**
+ * How long a subagent may stay continuously `stalled` before the parent's
+ * watchdog stops it. Off by default; set `PI_SUBAGENT_STALL_TIMEOUT_MS` to a
+ * positive number of milliseconds to enable auto-stop. `0`/unset disables it.
+ */
+function getStallTimeoutMs(): number {
+  const raw = process.env.PI_SUBAGENT_STALL_TIMEOUT_MS?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return 0;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
+/** One-line live description of a running subagent, shared by the tools and the /subagents UI. */
+function describeRunningSubagent(running: RunningSubagent, now = Date.now()): string {
+  const snapshot = classifyStatus(running.statusState, now);
+  const elapsed = formatElapsed(Math.floor((now - running.startTime) / 1000));
+  const agentTag = running.agent ? ` (${running.agent})` : "";
+
+  let detail: string;
+  switch (snapshot.kind) {
+    case "active":
+      detail =
+        `active${snapshot.activityLabel ? ` · ${snapshot.activityLabel}` : ""}` +
+        `${snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : ""}`;
+      break;
+    case "waiting":
+      detail =
+        `waiting${snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : ""}` +
+        `${snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : ""}`;
+      break;
+    case "stalled":
+      detail =
+        `stalled${snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : ""}` +
+        `${snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : ""}`;
+      break;
+    case "running":
+      detail = "running";
+      break;
+    default:
+      detail = "starting";
+  }
+
+  return `${running.name}${agentTag} — ${elapsed} — ${detail}`;
+}
+
+/** Remove runtime sidecars so a resumed run never replays a stale question/error/steer. */
+function clearRuntimeSidecars(sessionFile: string): void {
+  for (const sidecar of [
+    `${sessionFile}.ask`,
+    `${sessionFile}.exit`,
+    `${sessionFile}.steer`,
+  ]) {
+    try {
+      unlinkSync(sidecar);
+    } catch {
+      // Absent — nothing to do.
+    }
+  }
+}
+
+/**
+ * Stop a running subagent: abort its watcher and tear down its surface.
+ *
+ * The abort happens before the surface is closed so the watcher always takes
+ * the cancellation path (rather than reporting the surface as having vanished).
+ * The run's session file is left on disk so it can still be resumed later.
+ */
+function stopSubagent(running: RunningSubagent, reason = "stopped by user"): void {
+  if (!runningSubagents.has(running.id)) return;
+  running.stopReason = reason;
+  runningSubagents.delete(running.id);
+
+  try {
+    running.abortController?.abort();
+  } catch {
+    // Best effort.
+  }
+  try {
+    closeSurface(running.surface);
+  } catch {
+    // The pane/process may already be gone.
+  }
+
+  // Drop runtime sidecars so a stale question/steer isn't replayed on resume.
+  clearRuntimeSidecars(running.sessionFile);
+
+  updateWidget();
+}
+
+/** Stop every running subagent; returns the names that were stopped. */
+function stopAllSubagents(reason = "stopped by user"): string[] {
+  const running = Array.from(runningSubagents.values());
+  for (const agent of running) stopSubagent(agent, reason);
+  return running.map((agent) => agent.name);
+}
+
+/**
+ * Interactive manager used by the `/subagents` command and the
+ * `ctrl+alt+s` shortcut: pick a running subagent, then view its output, send
+ * it a message, or stop it.
+ */
+async function runSubagentManager(ctx: ExtensionContext): Promise<void> {
+  for (;;) {
+    const running = Array.from(runningSubagents.values());
+    if (running.length === 0) {
+      ctx.ui.notify("No subagents are currently running.", "info");
+      return;
+    }
+
+    const now = Date.now();
+    const labels = running.map((agent) => describeRunningSubagent(agent, now));
+
+    if (!ctx.hasUI) {
+      ctx.ui.notify(labels.join("\n"), "info");
+      return;
+    }
+
+    const picked = await ctx.ui.select("Running subagents — pick one", labels);
+    if (!picked) return;
+    const target = running[labels.indexOf(picked)];
+    if (!target || !runningSubagents.has(target.id)) {
+      ctx.ui.notify(`"${target?.name ?? "subagent"}" is no longer running.`, "warning");
+      continue;
+    }
+
+    const action = await ctx.ui.select(target.name, [
+      "View live output",
+      "Send a message",
+      "Stop this subagent",
+      "Close",
+    ]);
+    if (!action || action === "Close") continue;
+
+    if (action === "View live output") {
+      let output = "";
+      try {
+        output = readScreen(target.surface, 200).trimEnd();
+      } catch {
+        // Surface may have gone away.
+      }
+      await ctx.ui.editor(`${target.name} — live output`, output || "(no output captured yet)");
+      continue;
+    }
+
+    if (action === "Send a message") {
+      const message = await ctx.ui.input(`Message to ${target.name}`, "Type a message and press Enter");
+      if (!message?.trim()) continue;
+      const result = steerSubagent(target, message);
+      ctx.ui.notify(
+        "error" in result ? result.error : `Message delivered to "${target.name}".`,
+        "error" in result ? "error" : "info",
+      );
+      continue;
+    }
+
+    if (action === "Stop this subagent") {
+      const confirmed = await ctx.ui.confirm(
+        `Stop "${target.name}"?`,
+        "The subagent is killed immediately and produces no completion summary.",
+      );
+      if (!confirmed) continue;
+      stopSubagent(target, "stopped by the user");
+      ctx.ui.notify(`Stopped "${target.name}".`, "info");
+    }
+  }
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1102,6 +1310,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
     const transitionLines: string[] = [];
     const now = Date.now();
+    const stallTimeoutMs = getStallTimeoutMs();
+    const stalled: RunningSubagent[] = [];
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
@@ -1119,9 +1329,23 @@ function startStatusRefresh(pi: ExtensionAPI) {
       if (transition && !running.interactive) {
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
+
+      // Optional inactivity watchdog: stop a subagent that has been stalled
+      // (no valid activity snapshot) for longer than the configured budget.
+      // Disabled unless PI_SUBAGENT_STALL_TIMEOUT_MS is set to a positive value.
+      if (stallTimeoutMs > 0 && stallDurationMs(running.statusState, now) >= stallTimeoutMs) {
+        stalled.push(running);
+      }
     }
 
     if (shouldRefreshWidget) updateWidget();
+
+    for (const running of stalled) {
+      stopSubagent(
+        running,
+        `stalled for ${formatElapsed(Math.floor(stallTimeoutMs / 1000))} with no activity`,
+      );
+    }
 
     if (transitionLines.length > 0) {
       const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
@@ -1172,6 +1396,12 @@ export const __test__ = {
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
+  stopSubagent,
+  stopAllSubagents,
+  clearRuntimeSidecars,
+  deliverPendingQuestion,
+  describeRunningSubagent,
+  getStallTimeoutMs,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -1325,7 +1555,7 @@ async function launchSubagent(
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
+        `# Claude Code subagent launch script for ${sanitizeLabel(params.name)}`,
         `# Generated: ${new Date().toISOString()}`,
         `# Surface: ${surface}`,
       ].join("\n"),
@@ -1466,7 +1696,7 @@ async function launchSubagent(
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
+      `# Subagent launch script for ${sanitizeLabel(params.name)}`,
       `# Generated: ${new Date().toISOString()}`,
       `# Session: ${subagentSessionFile}`,
       `# Surface: ${surface}`,
@@ -1531,7 +1761,8 @@ function deliverPendingQuestion(running: RunningSubagent): void {
     if (!existsSync(askFile)) return;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
   } catch {
-    // Malformed/partway-written file — drop it and move on.
+    // Torn/partial write — leave the file for the next poll to retry.
+    return;
   }
   try {
     unlinkSync(askFile);
@@ -1570,6 +1801,7 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      exitFile: running.launchScriptFile ? `${running.launchScriptFile}.exitcode` : undefined,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1660,10 +1892,14 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: running.stopReason
+          ? `Subagent stopped: ${running.stopReason}.`
+          : "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
+        cancelled: true,
+        ...(running.stopReason ? { stopReason: running.stopReason } : {}),
         sessionFile,
       };
     }
@@ -1872,6 +2108,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            if (running.suppressResult) return;
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -1889,6 +2126,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: result.sessionFile,
                   ...(result.sessionId ? { sessionId: result.sessionId } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.cancelled ? { cancelled: true } : {}),
+                  ...(result.stopReason ? { stopReason: result.stopReason } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
                 },
@@ -1898,6 +2137,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
+            if (running.suppressResult) return;
             pi.sendMessage(
               {
                 customType: "subagent_result",
@@ -2047,6 +2287,168 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── subagent_status tool ──
+  pi.registerTool({
+      name: "subagent_status",
+      label: "Subagent Status",
+      description:
+        "Show what every running subagent is doing right now: name, agent, elapsed time, live status " +
+        "(active/waiting/stalled plus the current tool) and optionally the tail of its console output. " +
+        "Read-only and safe to call at any time — use it to answer \"what is the subagent doing?\" and to " +
+        "decide whether to stop one with subagent_stop.",
+      promptSnippet:
+        "Inspect running subagents and their live activity (optionally with an output tail). Read-only.",
+      parameters: Type.Object({
+        name: Type.Optional(
+          Type.String({
+            description: "Show only this running subagent. Omit to list every running subagent.",
+          }),
+        ),
+        outputLines: Type.Optional(
+          Type.Number({
+            description:
+              "Include the last N lines of live output per subagent (clamped to 0-200). Default 0 (status only).",
+          }),
+        ),
+      }),
+
+      async execute(_toolCallId, params) {
+        if (runningSubagents.size === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No subagents are currently running." }],
+            details: { agents: [] },
+          };
+        }
+
+        const now = Date.now();
+        let targets = Array.from(runningSubagents.values());
+        if (params.name?.trim()) {
+          const resolved = resolveRunningByName(params.name);
+          if ("error" in resolved) {
+            return {
+              content: [{ type: "text" as const, text: resolved.error }],
+              details: { error: resolved.error },
+            };
+          }
+          targets = [resolved.running];
+        }
+
+        const outputLines = Math.max(0, Math.min(200, Math.floor(params.outputLines ?? 0)));
+        const lines = targets.map((running) => describeRunningSubagent(running, now));
+
+        if (outputLines > 0) {
+          for (const running of targets) {
+            let output = "";
+            try {
+              output = readScreen(running.surface, outputLines).trimEnd();
+            } catch {
+              // Surface may have gone away between listing and reading.
+            }
+            lines.push(`── ${running.name} output (last ${outputLines} lines) ──`);
+            lines.push(output || "(no output captured yet)");
+          }
+        }
+
+        return {
+          content: [{ type: "text" as const, text: lines.join("\n") }],
+          details: {
+            agents: targets.map((running) => ({
+              id: running.id,
+              name: running.name,
+              agent: running.agent,
+              elapsed: Math.floor((now - running.startTime) / 1000),
+            })),
+          },
+        };
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const count = Array.isArray(details?.agents) ? details.agents.length : 0;
+        const title = count > 0 ? `${count} subagent${count === 1 ? "" : "s"} running` : text;
+        return new Text(theme.fg("dim", title), 0, 0);
+      },
+    });
+
+  // ── subagent_stop tool ──
+  pi.registerTool({
+      name: "subagent_stop",
+      label: "Stop Subagent",
+      description:
+        "Stop (kill) one or all running subagents by name. Use when the user asks to stop a subagent, " +
+        "when one is clearly stuck or stalled, or when its work is no longer needed. The subagent is " +
+        "terminated immediately and its watcher reports a \"stopped\" result — no completion summary is " +
+        "produced. The name stays addressable, so its session can still be resumed later with " +
+        "subagent_message when its session file exists.",
+      promptSnippet:
+        "Stop (kill) one or all running subagents by name. Terminates immediately; no completion summary.",
+      parameters: Type.Object({
+        name: Type.Optional(
+          Type.String({ description: "Exact name of the running subagent to stop." }),
+        ),
+        all: Type.Optional(
+          Type.Boolean({ description: "Stop every running subagent." }),
+        ),
+        reason: Type.Optional(
+          Type.String({ description: "Short reason recorded on the result (optional)." }),
+        ),
+      }),
+
+      async execute(_toolCallId, params) {
+        const reason = params.reason?.trim() || "stopped";
+
+        if (params.all && params.name?.trim()) {
+          const err = "Provide either `name` or `all: true`, not both.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        if (params.all) {
+          const stopped = stopAllSubagents(reason);
+          const text = stopped.length
+            ? `Stopped ${stopped.length} subagent(s): ${stopped.join(", ")}.`
+            : "No subagents were running.";
+          return {
+            content: [{ type: "text" as const, text }],
+            details: { stopped, status: stopped.length ? "stopped" : "none" },
+          };
+        }
+
+        if (!params.name?.trim()) {
+          const err =
+            "Provide `name` of the running subagent to stop, or `all: true` to stop every running subagent.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        const resolved = resolveRunningByName(params.name);
+        if ("error" in resolved) {
+          return {
+            content: [{ type: "text" as const, text: resolved.error }],
+            details: { error: resolved.error },
+          };
+        }
+
+        const { name, agent } = resolved.running;
+        stopSubagent(resolved.running, reason);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Stopped subagent "${name}"${agent ? ` (${agent})` : ""}.`,
+            },
+          ],
+          details: { name, agent, status: "stopped" },
+        };
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const icon = details?.status === "stopped" ? theme.fg("warning", "■") : theme.fg("dim", "•");
+        return new Text(`${icon} ${theme.fg("dim", text)}`, 0, 0);
+      },
+    });
+
 
 
   // ── subagent_message tool ──
@@ -2142,6 +2544,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             // The background process already exited but the watcher hasn't
             // reaped it yet (or the poll loop missed it). Drop the stale
             // handle and fall through to the resume path below.
+            //
+            // Only suppress the old watcher's result when the surface vanished
+            // WITHOUT a recorded exit code. If it exited normally, let the
+            // watcher deliver its real completion summary; suppressing it here
+            // would discard the finished run's result in a narrow race.
+            if (getProcessExit(runningMatch.surface) == null) {
+              runningMatch.suppressResult = true;
+              try { runningMatch.abortController?.abort(); } catch {}
+            }
             try {
               closeSurface(runningMatch.surface);
             } catch {}
@@ -2153,7 +2564,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // ── Resume a finished session by name ──
         const message = params.message;
-        const name = requestedName; // identity preservation: the resumed run reclaims its name
+        let name = requestedName; // identity preservation: the resumed run reclaims its name
         const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
@@ -2163,7 +2574,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionDir(),
           ctx.sessionManager.getSessionId(),
         );
-        const entry = resolveNameInRegistry(parentArtifactDir, requestedName);
+        let entry = resolveNameInRegistry(parentArtifactDir, requestedName);
+        if (!entry) {
+          const registry = readNameRegistry(parentArtifactDir);
+          const ciKeys = Object.keys(registry).filter(
+            (k) => k.toLowerCase() === requestedName.toLowerCase(),
+          );
+          if (ciKeys.length === 1) {
+            entry = registry[ciKeys[0]];
+            name = ciKeys[0];
+          }
+        }
         if (!entry) {
           const known = Object.keys(readNameRegistry(parentArtifactDir));
           const err =
@@ -2204,13 +2625,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
+        const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? name;
 
         // Record entry count before resuming so we can extract new messages.
         // Count lines cheaply (no per-line JSON.parse) so resuming a large
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
+        clearRuntimeSidecars(sessionPath);
         const surface = createSurface(name);
         if (!isProcessSurface(surface)) {
           await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -2290,7 +2712,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
-            `# Subagent resume script for ${name}`,
+            `# Subagent resume script for ${sanitizeLabel(name)}`,
             `# Generated: ${new Date().toISOString()}`,
             `# Session: ${sessionPath}`,
             `# Surface: ${surface}`,
@@ -2325,6 +2747,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+            if (running.suppressResult) return;
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
@@ -2351,6 +2774,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.cancelled ? { cancelled: true } : {}),
+                  ...(result.stopReason ? { stopReason: result.stopReason } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2358,6 +2783,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
+            if (running.suppressResult) return;
             pi.sendMessage(
               {
                 customType: "subagent_result",
@@ -2382,6 +2808,51 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  // /subagents command — inspect and control running subagents
+  pi.registerCommand("subagents", {
+    description: "Inspect and control running subagents: /subagents [stop <name>| <name>]",
+    handler: async (args, ctx) => {
+      const trimmed = args.trim();
+
+      if (trimmed === "stop" || trimmed.startsWith("stop ")) {
+        const name = trimmed.slice(4).trim();
+        if (!name) {
+          ctx.ui.notify("Usage: /subagents stop <name>", "warning");
+          return;
+        }
+        const resolved = resolveRunningByName(name);
+        if ("error" in resolved) {
+          ctx.ui.notify(resolved.error, "error");
+          return;
+        }
+        const stoppedName = resolved.running.name;
+        stopSubagent(resolved.running, "stopped by the user");
+        ctx.ui.notify(`Stopped "${stoppedName}".`, "info");
+        return;
+      }
+
+      if (trimmed) {
+        const resolved = resolveRunningByName(trimmed);
+        if ("error" in resolved) {
+          ctx.ui.notify(resolved.error, "error");
+          return;
+        }
+        ctx.ui.notify(describeRunningSubagent(resolved.running), "info");
+        return;
+      }
+
+      await runSubagentManager(ctx);
+    },
+  });
+
+  // Open the subagent manager with ctrl+alt+s
+  pi.registerShortcut("ctrl+alt+s", {
+    description: "Manage running subagents (view output / message / stop)",
+    handler: async (ctx) => {
+      await runSubagentManager(ctx);
+    },
+  });
 
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
@@ -2423,15 +2894,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
         const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
+        const stopped = details.cancelled === true;
+        const failed = !stopped && (exitCode !== 0 || !!errorMessage);
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
-        const bgFn = failed
-          ? (text: string) => theme.bg("toolErrorBg", text)
-          : (text: string) => theme.bg("toolSuccessBg", text);
+        const bgFn = stopped
+          ? (text: string) => theme.bg("customMessageBg", text)
+          : failed
+            ? (text: string) => theme.bg("toolErrorBg", text)
+            : (text: string) => theme.bg("toolSuccessBg", text);
         const stats = (details.stats ?? null) as SessionStats | null;
-        const icon = failed
-          ? theme.fg("error", "✗")
-          : theme.fg("success", "✓");
+        const icon = stopped
+          ? theme.fg("warning", "■")
+          : failed
+            ? theme.fg("error", "✗")
+            : theme.fg("success", "✓");
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
         const modelTag = stats?.model ? theme.fg("dim", ` (${stats.model})`) : "";
         const titleSegment = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag}${modelTag} ${theme.fg("dim", "—")} `;
@@ -2439,7 +2915,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Success: icon already conveys "completed", so show "N tools · duration"
         // like the in-process extension. Failure: surface the failure reason.
         let header: string;
-        if (failed) {
+        if (stopped) {
+          const reason = typeof details.stopReason === "string" && details.stopReason ? ` (${details.stopReason})` : "";
+          header = `${titleSegment}${theme.fg("warning", `stopped${reason}`)} ${theme.fg("dim", `· ${elapsed}`)}`;
+        } else if (failed) {
           const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
           header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
         } else {
@@ -2469,6 +2948,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
+          .replace(
+            new RegExp(
+              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" stopped after ${elapsed}[^\\n]*\\.\\n\\n`,
+            ),
+            "",
+          )
           .replace(
             new RegExp(
               `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,

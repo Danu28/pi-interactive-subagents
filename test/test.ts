@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -43,7 +43,11 @@ import {
   observeStatus,
   loadStatusConfig,
   parseStatusConfig,
+  stallDurationMs,
+  INACTIVITY_STALLED_AFTER_MS,
+  TOOL_INACTIVITY_STALLED_AFTER_MS,
 } from "../pi-extension/subagents/status.ts";
+import { createSurface, closeSurface } from "../pi-extension/subagents/surface.ts";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -388,6 +392,19 @@ describe("session.ts", () => {
       mkdirSync(adir, { recursive: true });
       writeFileSync(nameRegistryPath(adir), "not json{", "utf8");
       assert.deepEqual(readNameRegistry(adir), {});
+    });
+
+    it("backs up a corrupt registry instead of losing it on re-register", () => {
+      const adir = join(dir, "art-corrupt");
+      mkdirSync(adir, { recursive: true });
+      writeFileSync(nameRegistryPath(adir), "garbage{{", "utf8");
+      registerName(adir, "worker", { sessionFile: "/s/w.jsonl", sessionId: "id" });
+      assert.deepEqual(resolveNameInRegistry(adir, "worker"), {
+        sessionFile: "/s/w.jsonl",
+        sessionId: "id",
+      });
+      const backups = readdirSync(adir).filter((f) => f.includes("corrupt"));
+      assert.equal(backups.length, 1);
     });
   });
 
@@ -809,6 +826,81 @@ describe("status.ts", () => {
     const snapshot = classifyStatus(state, 240_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.waitingDurationText, "3m");
+  });
+
+  it("marks a hung-but-active (non-tool) snapshot stalled after the inactivity budget", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 5_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      activeSince: 5_000,
+      activityLabel: "streaming",
+    }, 5_000);
+
+    const justBelow = classifyStatus(state, 5_000 + INACTIVITY_STALLED_AFTER_MS - 1);
+    assert.equal(justBelow.kind, "active");
+
+    const stale = classifyStatus(state, 5_000 + INACTIVITY_STALLED_AFTER_MS + 1);
+    assert.equal(stale.kind, "stalled");
+    assert.equal(stale.statusLabel, "no recent activity");
+  });
+
+  it("gives tool-scope activity the longer inactivity budget", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 5_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "tool",
+      activeSince: 5_000,
+      activityLabel: "bash",
+    }, 5_000);
+
+    const pastShortBudget = classifyStatus(state, 5_000 + INACTIVITY_STALLED_AFTER_MS + 1);
+    assert.equal(pastShortBudget.kind, "active");
+
+    const pastLongBudget = classifyStatus(state, 5_000 + TOOL_INACTIVITY_STALLED_AFTER_MS + 1);
+    assert.equal(pastLongBudget.kind, "stalled");
+    assert.equal(pastLongBudget.statusLabel, "no recent activity");
+  });
+
+  it("never marks a stale waiting snapshot as stalled", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 10_000,
+      sequence: 1,
+      phase: "waiting",
+      waitingSince: 10_000,
+      latestEvent: "agent_end",
+    }, 10_000);
+
+    const snapshot = classifyStatus(state, 10_000 + TOOL_INACTIVITY_STALLED_AFTER_MS + 60_000);
+    assert.equal(snapshot.kind, "waiting");
+  });
+
+  it("stallDurationMs measures now minus the last activity for a stale active state", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 5_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      activeSince: 5_000,
+      activityLabel: "streaming",
+    }, 5_000);
+
+    const now = 5_000 + INACTIVITY_STALLED_AFTER_MS + 1;
+    assert.equal(classifyStatus(state, now).kind, "stalled");
+    assert.equal(stallDurationMs(state, now), now - 5_000);
   });
 
   it("uses elapsed-only fallback for claude-backed subagents", () => {
@@ -2151,6 +2243,68 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("resolves a running subagent name case-insensitively", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "a1", sessionFile: "a1.jsonl" }));
+      const resolved = testApi.resolveRunningByName("worker");
+      assert.equal(resolved.running.name, "Worker");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reaps a dead process surface in subagent_message (suppresses the stale result, aborts the watcher)", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const prevBackend = process.env.PI_SUBAGENT_BACKEND;
+    process.env.PI_SUBAGENT_BACKEND = "process";
+    runningMap.clear();
+    // A live handle that is then closed: still a `proc:` surface, but the
+    // record is gone so the surface reads as dead.
+    const deadSurface = createSurface("reap-worker");
+    closeSurface(deadSurface);
+    let aborted = false;
+    const running = makeRunning({
+      id: "reap-1",
+      name: "ReapWorker",
+      surface: deadSurface,
+      sessionFile: join(tmpdir(), `pi-reap-${Date.now()}.jsonl`),
+      abortController: { abort: () => { aborted = true; } },
+    });
+    runningMap.set("reap-1", running);
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((tool) => tool.name === "subagent_message");
+      assert.ok(tool, "expected subagent_message to be registered");
+      const artifactDir = mkdtempSync(join(tmpdir(), "pi-reap-art-"));
+      try {
+        const ctx = {
+          sessionManager: {
+            getSessionDir: () => artifactDir,
+            getSessionId: () => "sess-reap",
+          },
+        } as any;
+        // No registry entry: the resume path cannot proceed, but the stale
+        // running entry must already have been reaped above it.
+        const result = await tool.execute("t", { name: "ReapWorker", message: "are you there?" }, undefined, undefined, ctx);
+        assert.match(result.content[0].text, /No subagent named/);
+        assert.equal(running.suppressResult, true);
+        assert.equal(aborted, true);
+        assert.equal(runningMap.has("reap-1"), false);
+      } finally {
+        rmSync(artifactDir, { recursive: true, force: true });
+      }
+    } finally {
+      runningMap.clear();
+      if (prevBackend === undefined) delete process.env.PI_SUBAGENT_BACKEND;
+      else process.env.PI_SUBAGENT_BACKEND = prevBackend;
+    }
+  });
+
   it("uniqueRunningName suffixes defaulted names that collide with running subagents", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -2676,5 +2830,242 @@ describe("tmux.ts", () => {
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
     });
+  });
+});
+
+describe("subagent control (status / stop)", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function makeRunning(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "a1",
+      name: "Worker",
+      task: "",
+      surface: "proc:none",
+      startTime: 0,
+      sessionFile: join(tmpdir(), `pi-control-${Math.random().toString(16).slice(2)}.jsonl`),
+      interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      ...overrides,
+    };
+  }
+
+  it("registers the subagent_stop/subagent_status tools and the /subagents command", () => {
+    const { api, registeredTools, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const names = registeredTools.map((tool) => tool.name);
+    assert.equal(names.includes("subagent_stop"), true);
+    assert.equal(names.includes("subagent_status"), true);
+    assert.equal(registeredCommands.some((command) => command.name === "subagents"), true);
+  });
+
+  it("rejects subagent_stop with both name and all", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const tool = registeredTools.find((tool) => tool.name === "subagent_stop");
+    assert.ok(tool, "expected subagent_stop to be registered");
+    const result = await tool.execute("t", { name: "x", all: true });
+    assert.match(result.content[0].text, /not both/);
+  });
+
+  it("stops a running subagent: aborts the watcher and removes it from the map", () => {
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    let aborted = false;
+    try {
+      const running = makeRunning({
+        id: "s1",
+        name: "Scout",
+        surface: "proc:gone",
+        abortController: { abort: () => { aborted = true; } },
+      });
+      runningMap.set("s1", running);
+
+      testApi.stopSubagent(running, "no longer needed");
+
+      assert.equal(aborted, true);
+      assert.equal(runningMap.has("s1"), false);
+      assert.equal(running.stopReason, "no longer needed");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("stopAllSubagents returns the names it stopped", () => {
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      runningMap.set("a", makeRunning({ id: "a", name: "Worker", surface: "proc:a" }));
+      runningMap.set("b", makeRunning({ id: "b", name: "Scout", surface: "proc:b" }));
+      const stopped = testApi.stopAllSubagents("done");
+      assert.deepEqual(stopped.sort(), ["Scout", "Worker"]);
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("describeRunningSubagent reports phase and current tool", () => {
+    const active = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 0 }),
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
+    const running = makeRunning({ name: "Worker", agent: "worker", statusState: active });
+
+    const line = withMockedNow(20_000, () => testApi.describeRunningSubagent(running, 20_000));
+    assert.match(line, /^Worker \(worker\) — 20s — active · bash/);
+  });
+
+  it("getStallTimeoutMs honors PI_SUBAGENT_STALL_TIMEOUT_MS (disabled by default)", () => {
+    const prev = process.env.PI_SUBAGENT_STALL_TIMEOUT_MS;
+    try {
+      delete process.env.PI_SUBAGENT_STALL_TIMEOUT_MS;
+      assert.equal(testApi.getStallTimeoutMs(), 0);
+      process.env.PI_SUBAGENT_STALL_TIMEOUT_MS = "120000";
+      assert.equal(testApi.getStallTimeoutMs(), 120000);
+      process.env.PI_SUBAGENT_STALL_TIMEOUT_MS = "0";
+      assert.equal(testApi.getStallTimeoutMs(), 0);
+      process.env.PI_SUBAGENT_STALL_TIMEOUT_MS = "nonsense";
+      assert.equal(testApi.getStallTimeoutMs(), 0);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_STALL_TIMEOUT_MS", prev);
+    }
+  });
+
+  it("presents a stopped subagent distinctly from a completion", () => {
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 42,
+        summary: "Subagent stopped: no longer needed.",
+        sessionFile: "/tmp/x.jsonl",
+        cancelled: true,
+        stopReason: "no longer needed",
+      },
+      "Worker",
+    );
+    assert.match(presentation, /stopped after/);
+    assert.match(presentation, /no longer needed/);
+    assert.doesNotMatch(presentation, /completed/);
+    assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
+  });
+});
+
+describe("regression fixes", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("parses CRLF and BOM agent definitions", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-crlf-"));
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    try {
+      const agentsDir = join(root, "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      const crlfBody = (name: string) =>
+        [
+          "---",
+          `name: ${name}`,
+          "description: CRLF regression agent",
+          "model: anthropic/test-crlf",
+          "tools: read,bash",
+          "---",
+          "",
+          `You are ${name}.`,
+          "",
+        ].join("\r\n");
+      writeFileSync(join(agentsDir, "crlf-test-agent.md"), crlfBody("crlf-test-agent"), "utf8");
+      writeFileSync(join(agentsDir, "bom-test-agent.md"), "\uFEFF" + crlfBody("bom-test-agent"), "utf8");
+      process.env.PI_CODING_AGENT_DIR = root;
+      const loaded = testApi.loadAgentDefaults("crlf-test-agent");
+      assert.ok(loaded, "expected CRLF agent to load");
+      assert.equal(loaded.tools, "read,bash");
+      const loadedBom = testApi.loadAgentDefaults("bom-test-agent");
+      assert.ok(loadedBom, "expected BOM agent to load");
+      assert.equal(loadedBom.tools, "read,bash");
+    } finally {
+      restoreEnvVar("PI_CODING_AGENT_DIR", prev);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("clearRuntimeSidecars removes ask/exit/steer sidecars", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-sidecars-"));
+    try {
+      const sf = join(dir, "s.jsonl");
+      writeFileSync(sf, JSON.stringify({ type: "session", id: "x" }) + "\n", "utf8");
+      for (const ext of [".ask", ".exit", ".steer"]) {
+        writeFileSync(sf + ext, "stale", "utf8");
+      }
+      testApi.clearRuntimeSidecars(sf);
+      for (const ext of [".ask", ".exit", ".steer"]) {
+        assert.equal(existsSync(sf + ext), false, `expected ${ext} to be removed`);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deliverPendingQuestion keeps a torn .ask for retry", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-asktorn-"));
+    try {
+      const sf = join(dir, "s.jsonl");
+      writeFileSync(sf, JSON.stringify({ type: "session", id: "x" }) + "\n", "utf8");
+      const running = {
+        id: "q1",
+        name: "Worker",
+        surface: "proc:gone",
+        startTime: Date.now(),
+        sessionFile: sf,
+      };
+      writeFileSync(`${sf}.ask`, '{"question":"parti', "utf8");
+      testApi.deliverPendingQuestion(running);
+      assert.equal(existsSync(`${sf}.ask`), true, "torn .ask must be kept for retry");
+      writeFileSync(`${sf}.ask`, JSON.stringify({ question: "are you done?" }), "utf8");
+      testApi.deliverPendingQuestion(running);
+      assert.equal(existsSync(`${sf}.ask`), false, "valid .ask must be consumed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("getStallTimeoutMs rejects duration-style values", () => {
+    const prev = process.env.PI_SUBAGENT_STALL_TIMEOUT_MS;
+    try {
+      process.env.PI_SUBAGENT_STALL_TIMEOUT_MS = "10m";
+      assert.equal(testApi.getStallTimeoutMs(), 0);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_STALL_TIMEOUT_MS", prev);
+    }
+  });
+
+  it("safe_bash blocks Windows destructive commands", async () => {
+    const { default: registerSafeBash } = await import("../pi-extension/subagents/tools/safe-bash.ts");
+    let captured: any = null;
+    registerSafeBash({ registerTool: (t: any) => { captured = t; } });
+    assert.ok(captured, "expected safe_bash to register a tool");
+    const commands = [
+      "rm -rf C:/",
+      "rm -rf --no-preserve-root /",
+      "del /f /s /q C:\\",
+      "format C:",
+      "rd /s /q C:\\",
+      'powershell -c "Remove-Item -Recurse -Force C:\\"',
+    ];
+    for (const command of commands) {
+      await assert.rejects(
+        captured.execute("t", { command }, null, null, null),
+        /blocked/,
+        `expected safe_bash to block: ${command}`,
+      );
+    }
   });
 });

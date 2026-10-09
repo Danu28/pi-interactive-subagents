@@ -77,6 +77,7 @@ export function isMsysBash(candidate: string): boolean {
     const result = spawnSync(candidate, ["-c", "uname -s"], {
       encoding: "utf8",
       timeout: 5000,
+      windowsHide: true,
     });
     if (result.error || result.status !== 0) return false;
     const sys = (result.stdout ?? "").trim().toLowerCase();
@@ -110,7 +111,7 @@ export function findBash(): string | null {
   candidates.push("bash", "/bin/bash");
   for (const candidate of candidates) {
     try {
-      const result = spawnSync(candidate, ["--version"], { stdio: "ignore", timeout: 5000 });
+      const result = spawnSync(candidate, ["--version"], { stdio: "ignore", timeout: 5000, windowsHide: true });
       if (result.error || result.status !== 0) continue;
       if (process.platform === "win32" && !isMsysBash(candidate)) continue;
       bashCache = candidate;
@@ -149,12 +150,12 @@ function markExited(record: ProcRecord, code: number, note?: string): void {
         // Best effort — the in-memory code is still authoritative.
       }
     }
-  }
-  if (note && record.logFile) {
-    try {
-      appendFileSync(record.logFile, `${note}\n`, "utf8");
-    } catch {
-      // Best effort.
+    if (note && record.logFile) {
+      try {
+        appendFileSync(record.logFile, `${note}\n`, "utf8");
+      } catch {
+        // Best effort.
+      }
     }
   }
   safeCloseLog(record);
@@ -257,16 +258,18 @@ function createProcessSurfaceRecord(surface: string): void {
  * The harness exit code for a process surface, or null while still running.
  * Reads the in-memory record first, then the persisted `.exitcode` file.
  */
-export function getProcessExit(surface: string): number | null {
+export function getProcessExit(surface: string, exitFile?: string | null): number | null {
   const record = procRecords.get(surface);
-  if (!record) return null;
-  if (record.exitCode != null) return record.exitCode;
-  if (record.exitFile && existsSync(record.exitFile)) {
+  if (record?.exitCode != null) return record.exitCode;
+  const file = record?.exitFile ?? exitFile ?? null;
+  if (file && existsSync(file)) {
     try {
-      const code = Number.parseInt(readFileSync(record.exitFile, "utf8").trim(), 10);
+      const code = Number.parseInt(readFileSync(file, "utf8").trim(), 10);
       if (Number.isInteger(code)) {
-        record.exitCode = code;
-        safeCloseLog(record);
+        if (record) {
+          record.exitCode = code;
+          safeCloseLog(record);
+        }
         return code;
       }
     } catch {
@@ -305,20 +308,24 @@ export function closeProcessSurface(surface: string): void {
   const child = record.child;
   try {
     if (child && child.exitCode == null && record.exitCode == null) {
-      try {
-        child.kill();
-      } catch {
-        // Best effort.
-      }
+      // Windows: kill the whole tree BEFORE the launcher dies. Terminating the
+      // bash launcher first makes `taskkill /T` fail ("process not found") and
+      // orphans the real pi grandchild.
       if (process.platform === "win32" && child.pid != null) {
         try {
           spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
             stdio: "ignore",
             timeout: 5000,
+            windowsHide: true,
           });
         } catch {
           // Best effort.
         }
+      }
+      try {
+        child.kill();
+      } catch {
+        // Best effort.
       }
     }
   } catch {
@@ -349,18 +356,44 @@ export function appendSteerMessage(sessionFile: string, message: string): void {
   appendFileSync(inbox, JSON.stringify({ message, at: Date.now() }) + "\n", "utf8");
 }
 
+/** Only complete lines (ending in `\n`); ignores a torn trailing partial line. */
+function completeSteerLines(raw: string): string[] {
+  return raw.split("\n").slice(0, -1).filter((line) => line.trim());
+}
+
 /** Count non-blank inbox lines (a child records this at startup to skip history). */
 export function countSteerInboxLines(sessionFile: string): number {
   try {
     const raw = readFileSync(steerInboxPath(sessionFile), "utf8");
-    let count = 0;
-    for (const line of raw.split("\n")) {
-      if (line.trim()) count++;
-    }
-    return count;
+    return completeSteerLines(raw).length;
   } catch {
     return 0;
   }
+}
+
+export function readSteerInboxEntriesAfter(
+  sessionFile: string,
+  fromLine: number,
+): { entries: { message: string; line: number }[]; nextLine: number } {
+  let raw: string;
+  try {
+    raw = readFileSync(steerInboxPath(sessionFile), "utf8");
+  } catch {
+    return { entries: [], nextLine: fromLine };
+  }
+  const lines = completeSteerLines(raw);
+  const entries: { message: string; line: number }[] = [];
+  for (let i = Math.max(0, fromLine); i < lines.length; i++) {
+    try {
+      const parsed = JSON.parse(lines[i]) as { message?: unknown };
+      if (parsed && typeof parsed.message === "string" && parsed.message.trim()) {
+        entries.push({ message: parsed.message, line: i });
+      }
+    } catch {
+      // Skip malformed complete lines.
+    }
+  }
+  return { entries, nextLine: lines.length };
 }
 
 /**
@@ -372,26 +405,8 @@ export function readSteerInboxAfter(
   sessionFile: string,
   fromLine: number,
 ): { messages: string[]; nextLine: number } {
-  let raw: string;
-  try {
-    raw = readFileSync(steerInboxPath(sessionFile), "utf8");
-  } catch {
-    return { messages: [], nextLine: fromLine };
-  }
-  const lines = raw.split("\n").filter((line) => line.trim());
-  const fresh = lines.slice(Math.max(0, fromLine));
-  const messages: string[] = [];
-  for (const line of fresh) {
-    try {
-      const parsed = JSON.parse(line) as { message?: unknown };
-      if (parsed && typeof parsed.message === "string" && parsed.message.trim()) {
-        messages.push(parsed.message);
-      }
-    } catch {
-      // Skip malformed lines.
-    }
-  }
-  return { messages, nextLine: lines.length };
+  const { entries, nextLine } = readSteerInboxEntriesAfter(sessionFile, fromLine);
+  return { messages: entries.map((e) => e.message), nextLine };
 }
 
 export const __procTest__ = { procRecords };

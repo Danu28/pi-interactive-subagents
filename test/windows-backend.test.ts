@@ -29,9 +29,12 @@ import {
   isProcessAlive,
   isProcessSurface,
   readSteerInboxAfter,
+  readSteerInboxEntriesAfter,
   resetFindBashCache,
   steerInboxPath,
+  __procTest__,
 } from "../pi-extension/subagents/process-backend.ts";
+import { getNewEntries } from "../pi-extension/subagents/session.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 const SAVED_ENV = { ...process.env };
@@ -187,7 +190,9 @@ describe("steer inbox", () => {
       });
       assert.deepEqual(result, { ok: true });
       const inbox = readSteerInboxAfter(join(dir, "s.jsonl"), 0);
-      assert.deepEqual(inbox.messages, ["do this then that"]);
+      // Process surfaces deliver via the JSON-line inbox, which safely carries
+      // newlines, so multi-line messages are preserved (tmux flattens instead).
+      assert.deepEqual(inbox.messages, ["do this\nthen that"]);
       surface.closeSurface(handle);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -298,10 +303,247 @@ describe("process spawn", () => {
   });
 });
 
+describe("durable exit code", () => {
+  it("getProcessExit reads a persisted .exitcode file for an unknown handle", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-exitcode-"));
+    try {
+      const script = join(dir, "launch.sh");
+      writeFileSync(`${script}.exitcode`, "0", "utf8");
+      const unknown = `proc:never-seen-${Math.random().toString(16).slice(2)}`;
+      assert.equal(getProcessExit(unknown, `${script}.exitcode`), 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("steer inbox file helpers", () => {
   it("readSteerInboxAfter on a missing inbox returns the same cursor", () => {
     const missing = join(tmpdir(), `pi-nope-${Date.now()}.jsonl`);
     const read = readSteerInboxAfter(missing, 3);
     assert.deepEqual(read, { messages: [], nextLine: 3 });
+  });
+});
+
+describe("process surface liveness (no infinite hang)", () => {
+  it("pollForExit resolves when the process surface was released", async () => {
+    setBackend("process");
+    const handle = createProcessSurface();
+    // Release the record without ever recording an exit code — the watcher
+    // must resolve instead of polling a handle that no longer exists.
+    surface.closeSurface(handle);
+    const result = await surface.pollForExit(handle, new AbortController().signal, { interval: 20 });
+    assert.equal(result.reason, "error");
+    assert.match(result.errorMessage ?? "", /closed before completion/);
+  });
+});
+
+describe("process tree teardown (kill-order regression)", () => {
+  function powershellAvailable(): boolean {
+    if (process.platform !== "win32") return false;
+    try {
+      const out = spawnSync(
+        "powershell",
+        ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"],
+        { encoding: "utf8", timeout: 10000, windowsHide: true },
+      );
+      return !out.error && out.status === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  function descendantPids(rootPid: number): Set<number> {
+    try {
+      const out = spawnSync(
+        "powershell",
+        [
+          "-NoProfile",
+          "-Command",
+          "Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId | ConvertTo-Json -Compress",
+        ],
+        { encoding: "utf8", timeout: 10000, windowsHide: true },
+      );
+      if (out.error || out.status !== 0 || !out.stdout?.trim()) return new Set();
+      let rows: any = JSON.parse(out.stdout.trim());
+      if (!Array.isArray(rows)) rows = [rows];
+      const byParent = new Map<number, number[]>();
+      for (const row of rows) {
+        const pid = Number(row.ProcessId);
+        const ppid = Number(row.ParentProcessId);
+        if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+        const list = byParent.get(ppid) ?? [];
+        list.push(pid);
+        byParent.set(ppid, list);
+      }
+      const seen = new Set<number>([rootPid]);
+      const queue = [rootPid];
+      while (queue.length > 0) {
+        const cur = queue.pop()!;
+        for (const child of byParent.get(cur) ?? []) {
+          if (!seen.has(child)) {
+            seen.add(child);
+            queue.push(child);
+          }
+        }
+      }
+      seen.delete(rootPid);
+      return seen;
+    } catch {
+      return new Set();
+    }
+  }
+
+  function pidAlive(pid: number): boolean {
+    try {
+      const out = spawnSync(
+        "powershell",
+        [
+          "-NoProfile",
+          "-Command",
+          `Get-Process -Id ${pid} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id`,
+        ],
+        { encoding: "utf8", timeout: 10000, windowsHide: true },
+      );
+      return !out.error && (out.stdout ?? "").trim() === String(pid);
+    } catch {
+      return false;
+    }
+  }
+
+  it("closeSurface kills the whole process tree (Windows)", async () => {
+    setBackend("process");
+    if (!findBash()) {
+      console.log("⚠️  no bash — skipping process tree kill test");
+      return;
+    }
+    const dir = mkdtempSync(join(tmpdir(), "pi-proctree-"));
+    let handle: string | null = null;
+    try {
+      handle = surface.createSurface("w");
+      const scriptPath = join(dir, "tree.sh");
+      surface.sendLongCommand(handle, "sleep 300\n", { scriptPath });
+      const h = handle;
+      await waitFor(() => {
+        const rec = __procTest__.procRecords.get(h);
+        return rec?.child?.pid != null && isProcessAlive(h);
+      }, 10000);
+      const rootPid = __procTest__.procRecords.get(h)!.child!.pid!;
+      if (process.platform !== "win32") {
+        handle = null;
+        surface.closeSurface(h);
+        assert.equal(__procTest__.procRecords.has(h), false);
+        return;
+      }
+      if (!powershellAvailable()) {
+        console.log("⚠️  no powershell — skipping descendant assertion");
+        return;
+      }
+      // Give the sleep grandchild a moment to appear under the launcher.
+      await waitFor(() => descendantPids(rootPid).size > 0, 10000);
+      const before = descendantPids(rootPid);
+      assert.ok(before.size > 0, "expected a live grandchild before closeSurface");
+      handle = null; // closed below; finally must not double-close
+      surface.closeSurface(h);
+      assert.equal(__procTest__.procRecords.has(h), false);
+      const deadline = Date.now() + 5000;
+      for (;;) {
+        const still = [...before].filter(pidAlive);
+        if (still.length === 0) break;
+        if (Date.now() > deadline) {
+          assert.fail(`closeSurface orphaned processes: ${still.join(", ")}`);
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } finally {
+      try {
+        if (handle) surface.closeSurface(handle);
+      } catch {
+        // Best effort.
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("sentinel precedence (exit-code regression)", () => {
+  it("pollForExit prefers the shell sentinel over the bash exit code", async () => {
+    setBackend("process");
+    if (!findBash()) {
+      console.log("⚠️  no bash — skipping sentinel precedence test");
+      return;
+    }
+    const dir = mkdtempSync(join(tmpdir(), "pi-procsentinel-"));
+    let handle: string | null = null;
+    try {
+      handle = surface.createSurface("w");
+      const scriptPath = join(dir, "sentinel.sh");
+      surface.sendLongCommand(handle, "(exit 7); echo '__SUBAGENT_DONE_'$?'__'", { scriptPath });
+      const result = await surface.pollForExit(handle, new AbortController().signal, { interval: 50 });
+      assert.equal(result.exitCode, 7);
+    } finally {
+      try {
+        if (handle) surface.closeSurface(handle);
+      } catch {
+        // Best effort.
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("torn trailing line regressions", () => {
+  it("readSteerInboxAfter ignores a torn trailing line", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-steertorn-"));
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      writeFileSync(sessionFile, "", "utf8");
+      writeFileSync(steerInboxPath(sessionFile), '{"message":"first"}\n{"message":"parti', "utf8");
+      const first = readSteerInboxAfter(sessionFile, 0);
+      assert.deepEqual(first.messages, ["first"]);
+      assert.equal(first.nextLine, 1);
+      appendFileSync(steerInboxPath(sessionFile), 'al","at":2}\n', "utf8");
+      const second = readSteerInboxAfter(sessionFile, first.nextLine);
+      assert.deepEqual(second.messages, ["partial"]);
+      assert.equal(second.nextLine, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("readSteerInboxEntriesAfter returns per-message line indices", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-steeridx-"));
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      writeFileSync(sessionFile, "", "utf8");
+      appendSteerMessage(sessionFile, "one");
+      appendSteerMessage(sessionFile, "two");
+      const { entries, nextLine } = readSteerInboxEntriesAfter(sessionFile, 0);
+      assert.equal(entries.length, 2);
+      assert.equal(entries[0].line, 0);
+      assert.equal(entries[1].line, 1);
+      assert.equal(nextLine, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("getNewEntries skips a torn trailing JSONL line", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-sessiontorn-"));
+    try {
+      const file = join(dir, "s.jsonl");
+      writeFileSync(
+        file,
+        JSON.stringify({ type: "session", id: "x" }) + "\n" + '{"type":"message","id":"parti',
+        "utf8",
+      );
+      let entries: unknown[] = [];
+      assert.doesNotThrow(() => {
+        entries = getNewEntries(file, 0);
+      });
+      assert.equal(entries.length, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

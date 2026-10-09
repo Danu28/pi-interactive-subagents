@@ -192,9 +192,21 @@ export function registerName(
 ): void {
   try {
     mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
     const p = nameRegistryPath(artifactDir);
+    let registry: NameRegistry = {};
+    if (existsSync(p)) {
+      try {
+        const parsed = JSON.parse(readFileSync(p, "utf8"));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          registry = parsed as NameRegistry;
+        } else {
+          try { renameSync(p, `${p}.corrupt-${Date.now()}`); } catch { /* best effort */ }
+        }
+      } catch {
+        try { renameSync(p, `${p}.corrupt-${Date.now()}`); } catch { /* best effort */ }
+      }
+    }
+    registry[name] = entry;
     const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
     writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
     renameSync(tmp, p);
@@ -213,12 +225,22 @@ export function resolveNameInRegistry(
   return entry && typeof entry.sessionFile === "string" ? entry : null;
 }
 
+function parseEntryLines(raw: string): SessionEntry[] {
+  const entries: SessionEntry[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      entries.push(JSON.parse(line) as SessionEntry);
+    } catch {
+      // Skip a torn/malformed line (e.g. a killed subagent's last write).
+    }
+  }
+  return entries;
+}
+
 function readEntries(sessionFile: string): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
-  return raw
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => JSON.parse(line) as SessionEntry);
+  return parseEntryLines(raw);
 }
 
 /**
@@ -309,6 +331,8 @@ interface SessionIndex {
 }
 const sessionIndexCache = new Map<string, SessionIndex>();
 
+function sessionIndexKey(root: string): string { return process.platform === "win32" ? root.toLowerCase() : root; }
+
 function topLevelSignature(root: string): string {
   const parts: string[] = [];
   let entries: import("node:fs").Dirent[];
@@ -368,11 +392,12 @@ function indexDir(dir: string, idx: SessionIndex): void {
 }
 
 function getSessionIndex(sessionsRoot: string): SessionIndex {
-  let idx = sessionIndexCache.get(sessionsRoot);
+  const cacheKey = sessionIndexKey(sessionsRoot);
+  let idx = sessionIndexCache.get(cacheKey);
   const sig = topLevelSignature(sessionsRoot);
   if (!idx) {
     idx = { idToFile: new Map(), files: new Map(), topSig: sig };
-    sessionIndexCache.set(sessionsRoot, idx);
+    sessionIndexCache.set(cacheKey, idx);
     indexDir(sessionsRoot, idx); // first build: full scan, once per process
   } else if (idx.topSig !== sig) {
     idx.topSig = sig;
@@ -396,12 +421,23 @@ function lookupSessionIndex(
   // Exact match first.
   const exact = idx.idToFile.get(sessionId);
   if (exact && existsSync(exact.path)) return exact.path;
+  if (process.platform === "win32") {
+    const want = sessionId.toLowerCase();
+    for (const [id, rec] of idx.idToFile) {
+      if (id.toLowerCase() !== want) continue;
+      if (!existsSync(rec.path)) continue;
+      return rec.path;
+    }
+  }
 
   // Prefix match: most recently modified wins (ids are unique in practice, so
   // this is only a convenience for hand-typed short prefixes).
   let best: { path: string; mtime: number } | null = null;
+  const win32 = process.platform === "win32";
+  const wantPrefix = win32 ? sessionId.toLowerCase() : sessionId;
   for (const [id, rec] of idx.idToFile) {
-    if (!id.startsWith(sessionId)) continue;
+    const candidate = win32 ? id.toLowerCase() : id;
+    if (!candidate.startsWith(wantPrefix)) continue;
     if (!existsSync(rec.path)) continue;
     if (!best || rec.mtime > best.mtime) best = rec;
   }
@@ -460,7 +496,15 @@ export function countSessionEntryLines(sessionFile: string): number {
 export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
-  return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+  const entries: SessionEntry[] = [];
+  for (const line of lines.slice(afterLine)) {
+    try {
+      entries.push(JSON.parse(line) as SessionEntry);
+    } catch {
+      // Skip a torn/malformed line (e.g. a killed subagent's last write).
+    }
+  }
+  return entries;
 }
 
 /**

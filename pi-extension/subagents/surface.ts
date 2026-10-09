@@ -26,6 +26,7 @@ import {
   readScreen as tmuxReadScreen,
   readScreenAsync as tmuxReadScreenAsync,
   closeSurface as tmuxCloseSurface,
+  isTmuxSurfaceAlive,
   shellEscape,
   interpretExitSidecar,
 } from "./tmux.ts";
@@ -88,10 +89,10 @@ export function getBackendProblem(): string | null {
   return null;
 }
 
-/** True while the surface may still be running (unknown tmux panes count as alive). */
+/** True while the surface is still running (dead tmux panes are detected). */
 export function isSurfaceAlive(surface: string): boolean {
   if (isProcessSurface(surface)) return isProcessAlive(surface);
-  return true;
+  return isTmuxSurfaceAlive(surface);
 }
 
 /**
@@ -171,6 +172,7 @@ export interface PollOptions {
   interval: number;
   sessionFile?: string;
   sentinelFile?: string;
+  exitFile?: string;
   onTick?: (elapsed: number) => void;
 }
 
@@ -231,12 +233,11 @@ export async function pollForExit(
     }
 
     if (procSurface) {
-      // Process exit code (harness-recorded, no screen needed).
-      const code = getProcessExit(surface);
-      if (code != null) {
-        return { reason: "sentinel", exitCode: code };
-      }
-      // Slow path: log tail for the shell sentinel (crash detection parity).
+      // Prefer the shell sentinel: the launch script ends with
+      // `...; echo '__SUBAGENT_DONE_'$?'__'`, so the recorded bash exit code
+      // is always 0 and would mask a failing subagent. The sentinel carries the
+      // real `pi` exit code. Only fall back to the recorded exit code when no
+      // sentinel has been written yet (e.g. the process was killed).
       try {
         const tail = readProcessLog(surface, 5);
         const match = tail.match(/__SUBAGENT_DONE_(\d+)__/);
@@ -245,6 +246,21 @@ export async function pollForExit(
         }
       } catch {
         // Log may not exist yet — keep waiting.
+      }
+      // Process exit code (harness-recorded, no screen needed).
+      const code = getProcessExit(surface, options.exitFile);
+      if (code != null) {
+        return { reason: "sentinel", exitCode: code };
+      }
+      // The handle was released without an exit code (e.g. the parent process
+      // forgot it after a restart). Resolve as a failure instead of polling a
+      // surface that no longer exists forever.
+      if (!isProcessAlive(surface)) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage: "Subagent surface closed before completion (process handle was released).",
+        };
       }
     } else {
       // Slow path: read terminal screen for sentinel (crash detection)
@@ -265,6 +281,15 @@ export async function pollForExit(
               return interpretExitSidecar(data);
             }
           } catch {}
+        }
+        // No sidecar and the pane is gone: the subagent can never complete, so
+        // resolve now instead of looping forever on a dead pane.
+        if (!isTmuxSurfaceAlive(surface)) {
+          return {
+            reason: "error",
+            exitCode: 1,
+            errorMessage: "Subagent surface closed before completion (pane was killed).",
+          };
         }
       }
     }

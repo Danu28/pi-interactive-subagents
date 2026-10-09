@@ -74,7 +74,6 @@ export interface SubagentActivityRecorder {
 }
 
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;
-const MAX_WRITE_FAILURES = 3;
 const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "waiting", "done"]);
 const KNOWN_SCOPES = new Set<SubagentActivityScope>(["agent", "turn", "provider", "streaming", "tool"]);
 const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
@@ -313,7 +312,6 @@ export function createSubagentActivityRecorder(params: {
   };
 
   let disabled = false;
-  let failureCount = 0;
   let lastFlushAt = 0;
   let pendingFlush: ReturnType<typeof setTimeout> | null = null;
 
@@ -333,10 +331,11 @@ export function createSubagentActivityRecorder(params: {
     try {
       writeSubagentActivityFile(activityFile, activity);
       lastFlushAt = now();
-      failureCount = 0;
     } catch {
-      failureCount += 1;
-      if (failureCount >= MAX_WRITE_FAILURES) disable();
+      // Best effort: transient Windows rename failures (EPERM/EBUSY from AV
+      // scanners or indexers on the temp-file + rename write path) must not
+      // silence status forever, so never disable the recorder here; disable()
+      // stays reserved for markDone/sessionShutdown.
     }
   }
 

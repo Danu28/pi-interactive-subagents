@@ -23,18 +23,18 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  isMuxAvailable,
   createSurface,
-  createSurfaceSplit,
   sendCommand,
   sendLongCommand,
   readScreen,
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+  backendInUse,
+} from "../../pi-extension/subagents/surface.ts";
+import { createSurfaceSplit } from "./tmux.ts";
 
-// Re-export tmux primitives for tests
+// Re-export backend-agnostic surface primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -44,6 +44,7 @@ export {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  backendInUse,
 };
 
 // ── Paths ──
@@ -76,11 +77,15 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
+ * Backends available in the current environment.
+ *
+ * Returns ["tmux"] when the tmux backend is in use, otherwise ["process"]
+ * (notably native Windows, which has no tmux). NEVER returns [] — a file
+ * with zero registered tests is counted as 1 PASS by node:test, which used
+ * to make `npm run test:integration` report green while testing nothing.
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  return backendInUse() === "tmux" ? ["tmux"] : ["process"];
 }
 
 export function focusSurface(surface: string): void {

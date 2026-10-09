@@ -37,13 +37,11 @@ import {
 const backends = getAvailableBackends();
 const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
-if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping tmux-surface integration tests");
-  console.log("   Run inside tmux to enable these tests.");
-}
-
 for (const backend of backends) {
   describe(`tmux-surface [${backend}]`, { timeout: 60_000 }, () => {
+    // Tmux-only suite: when tmux is absent these register as SKIPPED
+    // (not PASS), so a missing-tmux run stays honest.
+    const tmuxSkip = backends.includes("tmux") ? false : "tmux required";
     let env: TestEnv;
 
     before(() => {
@@ -54,7 +52,16 @@ for (const backend of backends) {
       cleanupTestEnv(env);
     });
 
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
+    it("has an available backend", () => {
+      assert.ok(getAvailableBackends().length > 0, "expected at least one available backend");
+    });
+
+    it("requires tmux", { skip: tmuxSkip }, () => {});
+
+    it(
+      "keeps focus on the active surface while creating and targeting subagent surfaces",
+      { skip: tmuxSkip },
+      async () => {
       const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
 
@@ -81,7 +88,7 @@ for (const backend of backends) {
       assert.equal(getFocusedSurface(), anchor);
     });
 
-    it("creates a surface, sends a command, reads output, and closes it", async () => {
+    it("creates a surface, sends a command, reads output, and closes it", { skip: tmuxSkip }, async () => {
       const surface = createTrackedSurface(env, "echo-test");
       await sleep(1000);
 
@@ -99,7 +106,7 @@ for (const backend of backends) {
       untrackSurface(env, surface);
     });
 
-    it("preserves shell special characters in echo output", async () => {
+    it("preserves shell special characters in echo output", { skip: tmuxSkip }, async () => {
       const surface = createTrackedSurface(env, "escape-test");
       await sleep(1000);
 
@@ -120,7 +127,7 @@ for (const backend of backends) {
       );
     });
 
-    it("sends a long command via script file without truncation", async () => {
+    it("sends a long command via script file without truncation", { skip: tmuxSkip }, async () => {
       const surface = createTrackedSurface(env, "long-cmd-test");
       await sleep(1000);
 
@@ -142,7 +149,7 @@ for (const backend of backends) {
       );
     });
 
-    it("reads screen asynchronously", async () => {
+    it("reads screen asynchronously", { skip: tmuxSkip }, async () => {
       const surface = createTrackedSurface(env, "async-read-test");
       await sleep(1000);
 
@@ -157,7 +164,7 @@ for (const backend of backends) {
       );
     });
 
-    it("manages multiple surfaces concurrently", async () => {
+    it("manages multiple surfaces concurrently", { skip: tmuxSkip }, async () => {
       const s1 = createTrackedSurface(env, "multi-1");
       const s2 = createTrackedSurface(env, "multi-2");
       await sleep(1500);
@@ -175,7 +182,7 @@ for (const backend of backends) {
       assert.ok(screen2.includes(`S2_${m2}`), `Surface 2 missing marker. Got:\n${screen2}`);
     });
 
-    it("writes output to a file and verifies via surface", async () => {
+    it("writes output to a file and verifies via surface", { skip: tmuxSkip }, async () => {
       const surface = createTrackedSurface(env, "file-test");
       await sleep(1000);
 
