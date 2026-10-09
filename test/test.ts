@@ -1498,6 +1498,12 @@ describe("subagent discovery", () => {
       const agents = result.details?.agents ?? [];
 
       assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
+      for (const name of ["scout", "researcher", "worker"]) {
+        assert.ok(
+          agents.some((agent: any) => agent.name === name && agent.source === "package"),
+          `expected bundled agent ${name} to be discoverable from the installed package`,
+        );
+      }
       assert.match(result.content[0].text, /visible-discovery-test-agent/);
     });
   });
@@ -1914,6 +1920,23 @@ describe("commands", () => {
     assert.equal(sentUserMessages.length, 1);
     assert.match(sentUserMessages[0], /agent: "scout"/);
     assert.match(sentUserMessages[0], /map the auth code/);
+  });
+
+  it("explains that /subagent create is not an agent-creation command", () => {
+    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    const notifications: string[] = [];
+
+    (subagentsModule as any).default(api);
+
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
+    subagent.handler("create", {
+      ui: { notify(message: string) { notifications.push(message); } },
+    });
+
+    assert.equal(sentUserMessages.length, 0);
+    assert.match(notifications[0] ?? "", /does not create one/);
+    assert.match(notifications[0] ?? "", /Available agents:.*worker/);
   });
 
   it("does not register the removed /iterate or /plan commands", () => {

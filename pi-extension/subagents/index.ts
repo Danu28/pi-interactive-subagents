@@ -2909,8 +2909,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       const defs = loadAgentDefaults(agentName);
       if (!defs) {
+        const available = discoverAgentDefinitions().map((agent) => agent.name);
         ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
+          `Unknown subagent "${agentName}". This command runs an existing agent; it does not create one. ` +
+            `Usage: /subagent <agent> <task>. Available agents: ${available.join(", ") || "(none)"}.`,
           "error",
         );
         return;

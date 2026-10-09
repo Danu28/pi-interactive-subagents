@@ -10,6 +10,8 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 pi install git:github.com/Danu28/pi-interactive-subagents
 ```
 
+The package includes the extension and its bundled `scout`, `researcher`, and `worker` profiles. Ask Pi to list available subagents, or try `/subagent worker <task>`. `/subagent create` does **not** create a profile: `create` is treated as an agent name, so Pi reports it as unknown. To add an agent profile, create a Markdown file in `.pi/agents/` or `~/.pi/agent/agents/` (see [Custom agents](#custom-agents)).
+
 ## How it works
 
 `subagent()` returns immediately. Where tmux is available, the sub-agent runs in its own tmux pane. On native Windows, when pi is running inside Windows Terminal, it runs in a visible split pane; otherwise it uses a detached background process. All modes keep the same fire-and-forget flow. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
