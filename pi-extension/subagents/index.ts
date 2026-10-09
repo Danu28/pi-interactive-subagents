@@ -111,7 +111,12 @@ const SubagentParams = Type.Object({
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "One-spawn model override. A saved per-agent model selection takes precedence; otherwise this overrides the agent profile default.",
+    }),
+  ),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -492,6 +497,14 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
+}
+
+function resolveEffectiveModel(
+  params: Pick<Static<typeof SubagentParams>, "model">,
+  agentDefs: AgentDefaults | null,
+  configuredModel?: string,
+): string | undefined {
+  return configuredModel ?? params.model ?? agentDefs?.model;
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -1447,6 +1460,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  resolveEffectiveModel,
   readSubagentModelOverrides,
   writeSubagentModelOverrides,
   resolveEffectiveSessionMode,
@@ -1509,9 +1523,8 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const configuredModel =
-    params.model == null && params.agent ? readSubagentModelOverrides()[params.agent] : undefined;
-  const effectiveModel = params.model ?? configuredModel ?? agentDefs?.model;
+  const configuredModel = params.agent ? readSubagentModelOverrides()[params.agent] : undefined;
+  const effectiveModel = resolveEffectiveModel(params, agentDefs, configuredModel);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;

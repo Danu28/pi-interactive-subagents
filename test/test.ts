@@ -1476,6 +1476,16 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("uses saved model selections before one-spawn overrides and profile defaults", () => {
+    const resolve = (subagentsModule as any).__test__.resolveEffectiveModel;
+    assert.equal(
+      resolve({ model: "opencode-go/gpt-6-luna" }, { model: "profile/model" }, "saved/model"),
+      "saved/model",
+    );
+    assert.equal(resolve({ model: "one-shot/model" }, { model: "profile/model" }), "one-shot/model");
+    assert.equal(resolve({}, { model: "profile/model" }), "profile/model");
+  });
+
   it("persists per-agent model overrides in the global agent config directory", async () => {
     await withIsolatedAgentEnv(async ({ globalDir }) => {
       const testApi = (subagentsModule as any).__test__;

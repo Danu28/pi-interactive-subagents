@@ -49,9 +49,9 @@ There is also a `/subagent <agent> <task>` command for spawning directly, a
 defaults, and a `/subagents` command (or **Ctrl+Alt+S**) to inspect and control
 running agents. Model overrides are stored in
 `~/.pi/agent/subagent-models.json` (or the directory set by
-`PI_CODING_AGENT_DIR`) and apply to future spawns; an explicit `model` passed to
-`subagent()` still takes precedence, followed by this setting and then the
-agent profile's `model` field.
+`PI_CODING_AGENT_DIR`) and apply to future spawns. A saved per-agent selection
+takes precedence over a one-spawn `model` override; without a saved selection,
+the explicit override takes precedence over the agent profile's `model` field.
 
 ### Spawning
 
