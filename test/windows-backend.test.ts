@@ -112,7 +112,7 @@ describe("backend selection", () => {
     surface.closeSurface(handle);
   });
 
-  it("builds a split-pane command and restores focus to the parent pane", () => {
+  it("creates the first subagent beside Pi and restores focus to the parent pane", () => {
     const args = buildWindowsTerminalArgs({
       windowId: "0",
       cwd: "C:/project with spaces",
@@ -122,10 +122,45 @@ describe("backend selection", () => {
       scriptPath: "C:/project/launch.sh",
     });
     assert.ok(args.includes("split-pane"));
-    assert.ok(args.includes("-H"));
+    assert.ok(args.includes("-V"));
     assert.ok(args.includes("C:/project with spaces"));
     assert.ok(args.includes("Worker One"));
     assert.deepEqual(args.slice(-3), [";", "move-focus", "previous"]);
+  });
+
+  it("stacks only when another live subagent is in the same Windows Terminal window", () => {
+    setBackend("windows-terminal");
+    const first = surface.createSurface("First");
+    const second = surface.createSurface("Second");
+    try {
+      const firstRecord = __procTest__.procRecords.get(first)!;
+      firstRecord.windowId = "0";
+      firstRecord.launchStartedAt = Date.now();
+      assert.equal(__procTest__.hasActiveWindowsTerminalSurface("0", second), true);
+      assert.equal(__procTest__.hasActiveWindowsTerminalSurface("1", second), false);
+      firstRecord.exitCode = 0;
+      assert.equal(__procTest__.hasActiveWindowsTerminalSurface("0", second), false);
+    } finally {
+      surface.closeSurface(first);
+      surface.closeSurface(second);
+    }
+  });
+
+  it("stacks additional subagents in the right pane and restores focus to Pi", () => {
+    const args = buildWindowsTerminalArgs({
+      windowId: "0",
+      cwd: "C:/project",
+      title: "Scout",
+      bash: "C:/Git/bin/bash.exe",
+      wrapperPath: "C:/project/wrapper.sh",
+      scriptPath: "C:/project/launch.sh",
+      stackInRightPane: true,
+    });
+    const splitIndex = args.indexOf("split-pane");
+    assert.deepEqual(args.slice(splitIndex - 6, splitIndex + 2), [
+      "move-focus", "left", ";", "move-focus", "right", ";", "split-pane", "-H",
+    ]);
+    assert.deepEqual(args.slice(-3), [";", "move-focus", "left"]);
   });
 
   it("isMuxAvailable is true for the process backend (no tmux needed)", () => {

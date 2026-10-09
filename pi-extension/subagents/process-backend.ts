@@ -31,6 +31,7 @@ export interface ProcRecord {
   handle: string;
   kind: "process" | "windows-terminal";
   name?: string;
+  windowId?: string;
   child: ChildProcess | null;
   scriptPath: string | null;
   wrapperPath: string | null;
@@ -184,7 +185,7 @@ export function findWindowsTerminal(): string | null {
   return null;
 }
 
-/** Build the Windows Terminal CLI arguments for a side-by-side agent pane. */
+/** Build the Windows Terminal CLI arguments for a main/right or right-stack pane. */
 export function buildWindowsTerminalArgs(params: {
   windowId: string;
   cwd: string;
@@ -192,11 +193,16 @@ export function buildWindowsTerminalArgs(params: {
   bash: string;
   wrapperPath: string;
   scriptPath: string;
+  stackInRightPane?: boolean;
 }): string[] {
   const title = params.title.replace(/[\r\n]+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "").trim() || "Subagent";
+  const stackInRightPane = params.stackInRightPane ?? false;
   return [
     "-w", params.windowId,
-    "split-pane", "-H",
+    ...(stackInRightPane ? ["move-focus", "left", ";", "move-focus", "right", ";"] : []),
+    // WT's terminology is relative to the divider: -V puts the new pane to
+    // the right, while -H places it below the focused pane.
+    "split-pane", stackInRightPane ? "-H" : "-V",
     "--startingDirectory", params.cwd,
     "--title", title,
     "--suppressApplicationTitle",
@@ -204,8 +210,22 @@ export function buildWindowsTerminalArgs(params: {
     params.wrapperPath,
     params.scriptPath,
     ";",
-    "move-focus", "previous",
+    "move-focus", stackInRightPane ? "left" : "previous",
   ];
+}
+
+/** Whether another live subagent already occupies the right-hand area. */
+function hasActiveWindowsTerminalSurface(windowId: string, except: string): boolean {
+  for (const record of procRecords.values()) {
+    if (
+      record.handle === except ||
+      record.kind !== "windows-terminal" ||
+      record.windowId !== windowId ||
+      record.launchStartedAt == null
+    ) continue;
+    if (getProcessExit(record.handle) == null) return true;
+  }
+  return false;
 }
 
 function safeCloseLog(record: ProcRecord): void {
@@ -307,13 +327,17 @@ export function runScriptInWindowsTerminal(
     ].join("\n") + "\n";
     writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
 
+    const windowId = process.env.PI_SUBAGENT_WT_WINDOW?.trim() || "0";
+    const stackInRightPane = hasActiveWindowsTerminalSurface(windowId, surface);
+    record.windowId = windowId;
     const args = buildWindowsTerminalArgs({
-      windowId: process.env.PI_SUBAGENT_WT_WINDOW?.trim() || "0",
+      windowId,
       cwd: opts?.cwd ?? process.cwd(),
       title: record.name ?? "Subagent",
       bash,
       wrapperPath,
       scriptPath,
+      stackInRightPane,
     });
     const child = spawn(wt, args, {
       cwd: opts?.cwd ?? process.cwd(),
@@ -630,4 +654,4 @@ export function readSteerInboxAfter(
   return { messages: entries.map((e) => e.message), nextLine };
 }
 
-export const __procTest__ = { procRecords };
+export const __procTest__ = { procRecords, hasActiveWindowsTerminalSurface };

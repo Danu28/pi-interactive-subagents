@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-tmux panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). Windows Terminal uses its native split layout and restores focus to the parent pane after spawning. The tmux layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+tmux panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). Windows Terminal places Pi on the left and the first subagent on the right; later active subagents stack top-to-bottom in the right-hand area. Focus returns to Pi after each spawn. The tmux layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
