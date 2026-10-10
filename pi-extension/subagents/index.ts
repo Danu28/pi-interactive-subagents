@@ -140,8 +140,25 @@ const SUBAGENT_ORCHESTRATION_GUIDANCE =
   "Plan before spawning and use the smallest useful team; most coding tasks need one worker or no subagents. " +
   "Do not spawn every available role by default. Use scout only for needed read-only repository reconnaissance, " +
   "researcher only for external facts or documentation, and worker for implementation. " +
-  "Parallelize only independent tasks; if implementation depends on reconnaissance or research, wait for those results first. " +
-  "The main session owns delegation and integration.";
+  "When you delegate, act only as the orchestrator: assign complete tasks, do not perform the delegated research, inspection, or implementation yourself, and do not continue task work in parallel. " +
+  "After assigning work, stop and wait for the agents' completion results. If any assigned agent is still running, keep waiting; do not finalize early. " +
+  "If an agent asks a clarification question, answer only what is needed to unblock it, then resume waiting. " +
+  "Once all assigned agents have returned, reconcile their findings and deliver one consolidated final response. " +
+  "Parallelize only independent tasks; for dependent tasks, wait for prerequisite results before assigning the next agent. " +
+  "If no agent is needed, handle the task normally. " +
+  "Note important:Check subagent status at most once every 90 seconds — rely on the live widget above the editor and on automatic completion steer messages instead of polling. Do not repeatedly call subagent_status.";
+
+/** Throttle for subagent_status tool calls — prevents wasteful LLM polling. */
+const SUBAGENT_STATUS_THROTTLE_MS = (() => {
+  const raw = process.env.PI_SUBAGENT_STATUS_THROTTLE_MS?.trim();
+  if (raw && /^\d+$/.test(raw)) {
+    const n = Number(raw);
+    if (Number.isSafeInteger(n) && n >= 0) return n;
+  }
+  return 90_000;
+})();
+let lastSubagentStatusAtMs: number | null = null;
+let cachedSubagentStatusResult: { text: string; details: unknown } | null = null;
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
@@ -1285,6 +1302,11 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  get SUBAGENT_STATUS_THROTTLE_MS() { return SUBAGENT_STATUS_THROTTLE_MS; },
+  get lastSubagentStatusAtMs() { return lastSubagentStatusAtMs; },
+  set lastSubagentStatusAtMs(v: number | null) { lastSubagentStatusAtMs = v; },
+  get cachedSubagentStatusResult() { return cachedSubagentStatusResult; },
+  set cachedSubagentStatusResult(v: { text: string; details: unknown } | null) { cachedSubagentStatusResult = v; },
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveModel,
@@ -1495,6 +1517,9 @@ async function launchSubagent(
     };
 
     runningSubagents.set(id, running);
+    // Invalidate status throttle so next check includes the new subagent
+    lastSubagentStatusAtMs = null;
+    cachedSubagentStatusResult = null;
     return running;
   }
 
@@ -1637,6 +1662,9 @@ async function launchSubagent(
   };
 
   runningSubagents.set(id, running);
+  // Invalidate status throttle so next check includes the new subagent
+  lastSubagentStatusAtMs = null;
+  cachedSubagentStatusResult = null;
   return running;
 }
 
@@ -1863,6 +1891,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    lastSubagentStatusAtMs = null;
+    cachedSubagentStatusResult = null;
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -2220,9 +2250,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Show what every running subagent is doing right now: name, agent, elapsed time, live status " +
         "(active/waiting/stalled plus the current tool) and optionally the tail of its console output. " +
         "Read-only and safe to call at any time — use it to answer \"what is the subagent doing?\" and to " +
-        "decide whether to stop one with subagent_stop.",
+        "decide whether to stop one with subagent_stop. " +
+        "Throttled to once every 90 seconds: repeated calls within 90s return a cached result with remaining wait time. " +
+        "Rely on the live widget and automatic steer messages instead of polling.",
       promptSnippet:
-        "Inspect running subagents and their live activity (optionally with an output tail). Read-only.",
+        "Inspect running subagents and their live activity (optionally with an output tail). Read-only. " +
+        "Throttled to once every 90 seconds — do not poll repeatedly; rely on the widget and steer messages.",
       parameters: Type.Object({
         name: Type.Optional(
           Type.String({
@@ -2246,6 +2279,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         const now = Date.now();
+        // Throttle: at most once per SUBAGENT_STATUS_THROTTLE_MS. Return cached result with wait hint.
+        if (
+          SUBAGENT_STATUS_THROTTLE_MS > 0 &&
+          lastSubagentStatusAtMs != null &&
+          now - lastSubagentStatusAtMs < SUBAGENT_STATUS_THROTTLE_MS &&
+          cachedSubagentStatusResult
+        ) {
+          const remainingMs = SUBAGENT_STATUS_THROTTLE_MS - (now - lastSubagentStatusAtMs);
+          const remainingSec = Math.ceil(remainingMs / 1000);
+          const elapsedSec = Math.floor((now - lastSubagentStatusAtMs) / 1000);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `Subagent status was checked ${elapsedSec}s ago — throttled to once every ${SUBAGENT_STATUS_THROTTLE_MS / 1000}s. ` +
+                  `Wait ${remainingSec}s before checking again. Rely on the live widget above the editor and on automatic completion steer messages.` +
+                  `\n\nCached result from ${elapsedSec}s ago:\n${cachedSubagentStatusResult.text}`,
+              },
+            ],
+            details: {
+              ...(cachedSubagentStatusResult.details as object),
+              throttled: true,
+              remainingSec,
+              elapsedSec,
+            },
+          };
+        }
         let targets = Array.from(runningSubagents.values());
         if (params.name?.trim()) {
           const resolved = resolveRunningByName(params.name);
@@ -2274,16 +2335,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
+        const text = lines.join("\n");
+        const details = {
+          agents: targets.map((running) => ({
+            id: running.id,
+            name: running.name,
+            agent: running.agent,
+            elapsed: Math.floor((now - running.startTime) / 1000),
+          })),
+        };
+        // Cache for throttle window
+        lastSubagentStatusAtMs = now;
+        cachedSubagentStatusResult = { text, details };
         return {
-          content: [{ type: "text" as const, text: lines.join("\n") }],
-          details: {
-            agents: targets.map((running) => ({
-              id: running.id,
-              name: running.name,
-              agent: running.agent,
-              elapsed: Math.floor((now - running.startTime) / 1000),
-            })),
-          },
+          content: [{ type: "text" as const, text }],
+          details,
         };
       },
 
@@ -2291,7 +2357,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const details = result.details as any;
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         const count = Array.isArray(details?.agents) ? details.agents.length : 0;
-        const title = count > 0 ? `${count} subagent${count === 1 ? "" : "s"} running` : text;
+        const throttled = details?.throttled === true;
+        const title = throttled
+          ? `${count} subagent${count === 1 ? "" : "s"} running (cached — wait ${details.remainingSec ?? "?"}s)`
+          : count > 0 ? `${count} subagent${count === 1 ? "" : "s"} running` : text;
         return new Text(theme.fg("dim", title), 0, 0);
       },
     });
